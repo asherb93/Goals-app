@@ -149,6 +149,15 @@
             .concat(w.extra.map((x) => [k, x.name, x.amount || '', 'Other', x.checked ? 'Yes' : '']));
         }),
       },
+      // Every recipe (for 1 portion), whether or not it's on a menu.
+      'Recipes': {
+        headers: ['Recipe', 'Ingredients (1 portion)', 'kcal', 'Protein g', 'Carbs g', 'Fat g', 'Video', 'How to make it'],
+        rows: td.recipes.map((r) => {
+          const t = recipeTotals(td, r);
+          const ings = r.ingredients.map((i) => { const f = foodById(td, i.food); return f ? `${f.name} ${fmt1(num(i.grams))} g` : ''; }).filter(Boolean).join(', ');
+          return [r.name || 'Untitled recipe', ings, Math.round(t.kcal), Math.round(t.protein), Math.round(t.carbs), Math.round(t.fat), r.video || '', r.steps || ''];
+        }),
+      },
       'Meal Plan': {
         headers: ['Week of', 'Day', 'Meal', 'Recipe'],
         rows: weeks.flatMap((k) => {

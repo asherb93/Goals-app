@@ -27,7 +27,7 @@ const LEVELS = ['view', 'edit'];
 // Readable tabs each topic writes, so someone editing one topic can't write another topic's tabs.
 const TOPIC_TABS = {
   'monthly-balance': ['Monthly Balance', 'Income', 'Targets', 'Expenses', 'Transactions', 'Leftover Plan'],
-  'food': ['Groceries', 'Meal Plan'],
+  'food': ['Groceries', 'Meal Plan', 'Recipes'],
 };
 // Readable-tab columns that were renamed in a later app version, per tab: new name -> old names.
 const RENAMED_HEADERS = {
