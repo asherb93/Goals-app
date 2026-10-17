@@ -48,6 +48,7 @@
 
     const main = $('main');
     main.innerHTML = '';
+    main.className = 'main';
     hideTooltip();
     document.title = `${topic.title} · Goals`;
     if (!ui[topic.id]) ui[topic.id] = { month: Fmt.monthKey(new Date()) };
@@ -501,6 +502,7 @@
   window.App = {
     register(topic) { topics.push(topic); },
     rerender: render,
+    toast,
     async start() {
       applyTheme();
       initMenu();

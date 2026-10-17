@@ -9,7 +9,7 @@
  *   Users   – one row per person (passcodes are stored as salted hashes)
  *   Data    – each person's app data as JSON (split across columns when large)
  *   Shares  – owner → viewer pairs (view-only)
- *   Monthly Balance / Expenses / Leftover Plan – readable copies of everyone's numbers
+ *   Monthly Balance / Income / Targets / Expenses / Transactions / Leftover Plan – readable copies of everyone's numbers
  */
 
 const TOKEN_DAYS = 90;
@@ -20,6 +20,21 @@ const MAX_DATA = 1500000;
 const RESERVED = ['Users', 'Data', 'Shares'];
 const USERS = ['id', 'name', 'color', 'salt', 'pinHash', 'createdAt'];
 const SHARES = ['ownerId', 'viewerId', 'createdAt'];
+// Readable-tab columns that were renamed in a later app version, per tab: new name -> old names.
+const RENAMED_HEADERS = {
+  'Monthly Balance': {
+    'Income': ['Net salary'], 'Actual expenses': ['Expenses'], 'Planned leftover': ['Planned'],
+    'Target': ['Planned expenses'], 'Card': ['Card spending'],
+  },
+};
+
+// Every name a column has had (new and old), so rows written by older and newer app versions both map.
+function headerAliases(tab, h) {
+  const map = RENAMED_HEADERS[tab] || {};
+  if (map[h]) return [h].concat(map[h]);
+  const now = Object.keys(map).find((k) => map[k].indexOf(h) >= 0);
+  return now ? [h, now].concat(map[now].filter((x) => x !== h)) : [h];
+}
 
 function doGet() {
   return out({ ok: true, result: { app: 'goals', version: 1 } });
@@ -193,18 +208,27 @@ function writeReadable(user, sheets) {
   const cell = (v) => (typeof v === 'number' && isFinite(v)) || v instanceof Date
     ? v
     : "'" + String(v == null ? '' : v).replace(/^'/, '').slice(0, 1000);
-  Object.keys(sheets).slice(0, 6).forEach((name) => {
+  Object.keys(sheets).slice(0, 10).forEach((name) => {
     if (!/^[A-Za-z][A-Za-z0-9 ]{0,30}$/.test(name) || RESERVED.indexOf(name) >= 0) return;
     const spec = sheets[name] || {};
     const headers = ['Person'].concat((spec.headers || []).map(String)).concat(['Person ID']);
-    const last = headers.length - 1;
     const sh = sheet(name, headers);
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
-    const existing = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, headers.length).getValues() : [];
-    const idOf = (r) => String(r[last]).replace(/^'/, '');
-    const others = existing.filter((r) => idOf(r) && idOf(r) !== user.id).map((r) => r.map(cell));
+    const width = Math.max(sh.getLastColumn(), headers.length);
+    const oldHeaders = sh.getRange(1, 1, 1, width).getValues()[0].map(String);
+    const oldId = oldHeaders.indexOf('Person ID');
+    const existing = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues() : [];
+    // Other people's rows may use an older column layout (written by an older app version), so each
+    // value is carried over by its header name rather than its position.
+    const others = oldId < 0 ? [] : existing
+      .filter((r) => { const id = String(r[oldId]).replace(/^'/, ''); return id && id !== user.id; })
+      .map((r) => headers.map((h) => {
+        const j = headerAliases(name, h).map((x) => oldHeaders.indexOf(x)).find((x) => x >= 0);
+        return cell(j != null ? r[j] : '');
+      }));
     const mine = (spec.rows || []).map((r) =>
       [cell(user.name)].concat(headers.slice(1, -1).map((_, i) => cell(r[i]))).concat([cell(user.id)]));
+    sh.getRange(1, 1, 1, width).clearContent();
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
     rewrite(sh, headers, others.concat(mine));
   });
 }

@@ -26,7 +26,7 @@
       <ul class="legend ${cls || ''}">
         ${items.map((i) => `
           <li><span class="swatch${i.dashed ? ' dashed' : ''}" style="${i.dashed ? `border-color:${i.color}` : `background:${i.color}`}"></span>
-            <span class="legend-name">${esc(i.name)}</span>
+            <span class="legend-name" dir="auto">${esc(i.name)}</span>
             ${i.value != null ? `<span class="legend-value">${esc(i.value)}</span>` : ''}
             ${i.sub != null ? `<span class="legend-sub">${esc(i.sub)}</span>` : ''}</li>`).join('')}
       </ul>`;
@@ -52,22 +52,27 @@
       ${table(['Part', 'Amount', `% of ${baseLabel}`], segs.map((s) => [s.name, money(s.amount), share(s.amount)]))}`;
   }
 
-  // Ranked horizontal bars. items: {name, amount, color, tag?}
-  function barList(items, { basis, basisLabel, empty }) {
-    const shown = items.filter((i) => i.amount > 0).sort((a, b) => b.amount - a.amount);
-    if (!shown.length) return `<p class="empty">${esc(empty)}</p>`;
+  // "+3 more" under a capped list; the table view always has every row.
+  function moreNote(n) { return `<p class="more-note" data-more="${n}"${n > 0 ? '' : ' hidden'}>+${n} more in the table view</p>`; }
+
+  // Ranked horizontal bars. items: {name, amount, color, tag?}; limit caps the visible rows.
+  function barList(items, { basis, basisLabel, empty, limit }) {
+    const all = items.filter((i) => i.amount > 0).sort((a, b) => b.amount - a.amount);
+    if (!all.length) return `<p class="empty">${esc(empty)}</p>`;
+    const shown = limit ? all.slice(0, limit) : all;
     const max = Math.max(...shown.map((i) => i.amount));
     const share = (a) => (basis > 0 ? pct(a / basis) : '–');
     return `
       <div class="bar-list">
         ${shown.map((i) => `
           <div class="bar-row" ${tipAttrs(i.name, money(i.amount) + (basis > 0 ? ` · ${share(i.amount)} of ${basisLabel}` : '') + (i.tag ? ` · ${i.tag}` : ''))}>
-            <span class="bar-name">${esc(i.name)}${i.tag ? `<span class="bar-tag"><span class="swatch" style="background:${i.color}"></span>${esc(i.tag)}</span>` : ''}</span>
+            <span class="bar-name"><span dir="auto">${esc(i.name)}</span>${i.tag ? `<span class="bar-tag"><span class="swatch" style="background:${i.color}"></span>${esc(i.tag)}</span>` : ''}</span>
             <span class="bar-track"><span class="bar" style="width:${(i.amount / max) * 100}%;background:${i.color}"></span></span>
             <span class="bar-value">${money(i.amount)}</span>
           </div>`).join('')}
       </div>
-      ${table(['Name', 'Amount', `% of ${basisLabel}`], shown.map((i) => [i.name + (i.tag ? ` (${i.tag})` : ''), money(i.amount), share(i.amount)]))}`;
+      ${moreNote(all.length - shown.length)}
+      ${table(['Name', 'Amount', `% of ${basisLabel}`], all.map((i) => [i.name + (i.tag ? ` (${i.tag})` : ''), money(i.amount), share(i.amount)]))}`;
   }
 
   // Donut for part-to-whole at a glance. Items keep their given (entity) order around the ring;
@@ -122,8 +127,10 @@
   }
 
   // Stacked columns over time. points: {label, segments: [{name, value, color}], marker?, tip, tipSub, selected, note?}
-  function columns(points, { legendItems, ariaLabel, tableHeaders, tableRows }) {
-    const W = 640, H = 240, padL = 52, padR = 8, padT = 26, padB = 28;
+  // width/height: the box to draw into, in px, so labels stay true size when a card is resized.
+  function columns(points, { legendItems, ariaLabel, tableHeaders, tableRows, width, height }) {
+    const W = Math.max(320, Math.round(width || 640)), H = Math.max(110, Math.round(height || 240));
+    const padL = 52, padR = 8, padT = 26, padB = 28;
     const max = Math.max(1, ...points.map((p) => Math.max(sum(p.segments.map((s) => s.value)), p.marker || 0)));
     const ticks = niceTicks(max, 4);
     const hi = ticks[ticks.length - 1];
@@ -163,5 +170,41 @@
       ${table(tableHeaders, tableRows)}`;
   }
 
-  window.Charts = { table, legend, stackBar, barList, donut, columns };
+  // Target vs actual per row: the bar is actual, the dashed tick is the target. items: {name, actual, planned, color}
+  function bulletList(items, { empty, planLabel = 'Target', noPlan = 'No target', limit }) {
+    // Rows with a target first (that's the comparison people came for), then by size.
+    const all = items.filter((i) => i.actual > 0 || i.planned > 0)
+      .sort((a, b) => (b.planned > 0) - (a.planned > 0) || Math.max(b.actual, b.planned) - Math.max(a.actual, a.planned));
+    if (!all.length) return `<p class="empty">${esc(empty)}</p>`;
+    const shown = limit ? all.slice(0, limit) : all;
+    const max = Math.max(...shown.map((i) => Math.max(i.actual, i.planned)));
+    const status = (i) => {
+      if (i.status) return { text: i.status, cls: 'muted' };
+      if (!i.planned) return { text: noPlan, cls: 'muted' };
+      const d = i.actual - i.planned;
+      if (d > 0.005) return { text: `⚠ ${money(d)} over`, cls: 'negative' };
+      return { text: `${money(-d)} left`, cls: 'muted' };
+    };
+    return `
+      ${legend([{ name: 'Actual', color: 'var(--ink-2)' }, { name: planLabel, color: 'var(--ink)', dashed: true }], 'legend-inline')}
+      <div class="bullet-list">
+        ${shown.map((i) => {
+          const s = status(i);
+          return `
+          <div class="bullet-row" ${tipAttrs(i.name, i.status ? `${planLabel} ${money(i.planned)} · ${i.status}` : `Actual ${money(i.actual)} · ${planLabel} ${i.planned ? money(i.planned) : '–'}`)}>
+            <span class="bar-name"><span class="swatch" style="background:${i.color}"></span> <span dir="auto">${esc(i.name)}</span></span>
+            <span class="bullet-track">
+              ${i.actual > 0 ? `<span class="bar" style="width:${(i.actual / max) * 100}%;background:${i.color}"></span>` : ''}
+              ${i.planned ? `<span class="bullet-plan" style="left:${(i.planned / max) * 100}%"></span>` : ''}
+            </span>
+            <span class="bullet-values"><strong>${money(i.actual)}</strong><span class="muted"> / ${i.planned ? money(i.planned) : '–'}</span>
+              <span class="bullet-status ${s.cls}">${esc(s.text)}</span></span>
+          </div>`;
+        }).join('')}
+      </div>
+      ${moreNote(all.length - shown.length)}
+      ${table(['Category', 'Actual', planLabel, 'Difference'], all.map((i) => [i.name, i.status ? '–' : money(i.actual), i.planned ? money(i.planned) : '–', i.status || (i.planned ? money(i.actual - i.planned) : '–')]))}`;
+  }
+
+  window.Charts = { table, legend, stackBar, barList, bulletList, donut, columns };
 })();

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running
 
-Plain HTML/CSS/JS with no build step and no dependencies. Open `index.html` directly in a browser (`open index.html`). Scripts are classic `<script>` tags, not ES modules, because modules don't load over `file://`. Keep it that way unless a dev server is introduced. Script order in `index.html` matters: format → backends → store → charts → app → topics → `App.start()`.
+Plain HTML/CSS/JS with no build step and no dependencies. Open `index.html` directly in a browser (`open index.html`). Scripts are classic `<script>` tags, not ES modules, because modules don't load over `file://`. Keep it that way unless a dev server is introduced. Script order in `index.html` matters: format → backends → store → charts → xlsx → statements → app → topics (`monthlyBalance.js` before `monthlyBalanceCards.js`) → `App.start()`.
 
 There is no test suite. `node --check js/*.js js/topics/*.js` catches syntax errors. `apps-script/Code.gs` is Apps Script (V8) and can't run locally without mocks.
 
@@ -21,18 +21,31 @@ There is no test suite. `node --check js/*.js js/topics/*.js` catches syntax err
   - `ctx.changed()` and `ctx.rerender()`.
   - `exportRows` returns `{SheetName: {headers, rows}}`, which the Sheets backend writes as readable per-person tabs.
 - **Routing** (`js/app.js`). `#/<topic>/<input|dashboard>[/<personId>]`. A person id shows that person's dashboard read-only, and only if they shared it with you. App also owns the sign-in screen, people switcher, and the Sharing/Settings/Storage dialogs.
-- **Charts** (`js/charts.js`). HTML/SVG string builders: `stackBar`, `barList`, `donut`, `columns`, `legend`, `table`. Any element with `data-tip`/`data-tip-sub` gets the shared tooltip.
+- **Charts** (`js/charts.js`). HTML/SVG string builders: `stackBar`, `barList`, `bulletList` (target vs actual), `donut`, `columns`, `legend`, `table`. Any element with `data-tip`/`data-tip-sub` gets the shared tooltip.
 - `Fmt.esc` must wrap user text interpolated into `innerHTML`. App calls `Fmt.setCurrency` with the owner's currency before each render.
 
-### Monthly Balance (`js/topics/monthlyBalance.js`)
+### Monthly Balance (`js/topics/monthlyBalance.js` + `monthlyBalanceCards.js`)
 
-Topic data: `{categories: [{id, name}], months: {"YYYY-MM": {salary, expenses: [{id, name, category, amount}], allocations: [{id, name, mode: "amount"|"percent", value}]}}}`. `compute()` derives everything: percent allocations take a share of `max(left, 0)`. Empty months are deleted. The Input view renders once and updates figures in place, so fields keep focus.
+Topic data:
+- `categories: [{id, name, excluded?}]` (`catsVersion: 2`). `excluded` means "not spending", e.g. Transfers.
+- `months: {"YYYY-MM": {incomes: [{id, name, amount, repeat?}], targets: [{id, name, category, amount}], expenses: [{id, name, category, amount, method: "direct"|"card", repeat?}], allocations: [{id, name, mode, value}]}}` (`modelVersion: 4`; v4 replaced the single `salary` with `incomes`)
+- `transactions: [{id, date, chargeDate, month, merchant, amount, card, source, kind, sourceCategory?, category?, original?, installment?, importId}]`. `month` comes from the **charge date**. `category` is set only for a one-off manual choice.
+- `rules: [{id, key, match: "exact"|"contains", category}]`, keyed by `Statements.merchantKey()` (lowercased, codes/city/suffixes stripped).
+- `sourceMap` (overrides of `DEFAULT_SOURCE_MAP`, card-company category → ours), `imports` (with `undo` info), `templates` (saved column mappings for unknown formats, keyed by header signature).
+
+Target vs actual: **targets** are the plan and never count as spending. **Expenses** entered by hand are actual: `direct` (rent, bank transfer, cash) or `card` (card purchases not in an imported statement); `repeat` expenses are copied when a new month is started from the previous one. Actual card spending = manual card expenses + imported transactions. Anything in an `excluded` category doesn't count. `compute(td, month)` derives everything (`income`, `direct`, `card`, `totalExpenses`, `targetTotal`, `left`, …). `migrateMonths(td, fromVersion)` runs the steps in order: v3 turns v2 data (one list where `paidBy`/heuristic "card" lines were budgets) into targets + direct expenses without changing actual totals, and v4 turns `salary` into a "Net salary" income row. Read-only data is migrated on a copy. Targets are compared only with spending in their own categories (`targetedTarget` vs `targetedSpent`); targets without a category or in excluded categories don't count. On import, `manualOverlaps` offers hand-entered expenses the statement may already cover: 💳 card expenses in the purchase or charge month (same amount = pre-ticked), and migrated `guessed` direct lines in categories the statement has purchases in (moved to targets, like v2 did). What an import removed is stored on its `imports[].undo`, and removing the statement restores it. "Copy from <month>" and the ↻ buttons merge into what's already typed.
+
+A transaction's category resolves as manual choice → rule → card-company category → none (`MB.txnCategory`); keep that order when adding sources. Shared helpers are exported on `window.MB` for the cards file.
+
+UI: **My numbers** (`renderInput`) has a summary strip (income − spent = left) and tabs Income · Targets · Direct · Card · Leftover plan (`ctx.ui.inputTab`); all panels are rendered and only toggled, so ids stay stable. A month without income shows a draft "Net salary" row that only joins the month once used (`adoptDraft`). Copy/↻ merging matches rows by name (multiset, `IDENT`), never by id or amount, and `splitCovered` keeps rows the month's imported statement already covers from being added. **Dashboard** (`renderDashboard`) has a Week · Month · Year filter (`ctx.ui.period`, `ctx.ui.week`): `makePeriod`/`shiftPeriod` describe a period as month parts with weights, and `computePeriod` combines month results through the same `tally()` as `compute()`. A year adds up its months; a week takes each month's share by days (weeks start Sunday) and counts imported card purchases by purchase date. It uses the full window width and is laid out to fit one window on desktop (`fitToWindow` sets the height; `.fit`/`.short` classes) with capped lists (`limit`) and a per-card ⊞ table view; the trend chart is redrawn at its card's pixel size.
+
+Statement import: `js/xlsx.js` is a dependency-free .xlsx/.csv reader (zip via `DecompressionStream`, XML via `DOMParser`, date cells via styles). `js/statements.js` detects MAX and Cal by header words, finds columns, parses Israeli `DD-MM-YYYY` dates, refunds, standing orders, installments and foreign amounts, and assigns stable fingerprint ids so re-imports dedupe. Title rows (holder name, ID, account) are never stored. To support a new card company, add a profile/keywords there; unknown files fall back to the column-mapping step.
 
 ## Colors
 
 Chart colors are the dataviz skill's validated reference palette, defined as CSS variables (`--s1`…`--s8`, `--neutral`, `--other`) with separate light and dark values in `css/styles.css`. Gradients and badges are UI decoration only. Fixed roles in Monthly Balance:
 - Expenses are `--s2` (orange) and money left is `--s3` (aqua).
 - Leftover destinations use `ALLOC_COLORS` in an order validated for adjacent CVD separation after orange.
-- A category's color follows its position in the category list (first 8; the rest are gray).
+- A category's color follows its position in the category list (first 8; the rest are gray). Defaults are ordered so the usual big spenders get colors.
 
-The donut folds to 5 slices plus "Other". Keep labels in ink tokens, pair warnings (`--critical`) with ⚠ and text, and give every chart a legend and a "Show as table" fallback.
+The donut folds to 5 slices plus "Other", with "Needs a category" kept as its own lighter-gray slice. Keep labels in ink tokens, pair warnings (`--critical`) with ⚠ and text, and give every chart a legend and a "Show as table" fallback.
