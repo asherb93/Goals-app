@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Goals</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div id="boot" class="boot"><div class="brand-mark big">G</div></div>
+
+  <!-- Sign-in / profile picker -->
+  <div id="auth" class="auth" hidden></div>
+
+  <!-- Signed-in app -->
+  <div id="app" hidden>
+    <header class="app-header">
+      <div class="header-inner">
+        <a class="brand" href="#/"><span class="brand-mark">G</span><span>Goals</span></a>
+        <nav class="topic-nav" id="topic-nav" aria-label="Topics"></nav>
+        <span class="sync" id="sync" role="status" aria-live="polite"></span>
+        <div class="user-menu-wrap">
+          <button class="user-btn" id="user-btn" aria-haspopup="menu" aria-expanded="false"></button>
+          <div class="menu" id="user-menu" role="menu" hidden>
+            <div class="menu-head" id="menu-head"></div>
+            <button role="menuitem" data-menu="sharing">Sharing…</button>
+            <button role="menuitem" data-menu="settings">Settings…</button>
+            <button role="menuitem" data-menu="switch">Switch person</button>
+          </div>
+        </div>
+      </div>
+      <div class="header-inner tabs-row">
+        <nav class="view-tabs" id="view-tabs" aria-label="View"></nav>
+      </div>
+    </header>
+    <main id="main" class="main"></main>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <div id="tooltip" class="tooltip" role="tooltip" hidden>
+    <div class="tooltip-title"></div>
+    <div class="tooltip-sub"></div>
+  </div>
+
+  <!-- Settings -->
+  <dialog id="settings" class="dialog">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Currency</span>
+        <select id="set-currency" class="select">
+          <option value="ILS">₪ Israeli shekel (ILS)</option>
+          <option value="USD">$ US dollar (USD)</option>
+          <option value="EUR">€ Euro (EUR)</option>
+          <option value="GBP">£ British pound (GBP)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Theme (this device)</span>
+        <select id="set-theme" class="select">
+          <option value="auto">Match system</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+      <div class="field">
+        <span>Where data is stored</span>
+        <div class="inline-row">
+          <span id="storage-label" class="muted"></span>
+          <button type="button" class="btn btn-small" id="open-storage">Change…</button>
+        </div>
+      </div>
+      <div class="field">
+        <span>My data</span>
+        <div class="btn-row">
+          <button type="button" class="btn" id="export-data">Export backup</button>
+          <button type="button" class="btn" id="import-data">Import backup</button>
+          <input type="file" id="import-file" accept="application/json,.json" hidden>
+          <button type="button" class="btn btn-danger" id="reset-data">Erase my data</button>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn btn-primary" value="close">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Sharing -->
+  <dialog id="sharing" class="dialog">
+    <form method="dialog" id="sharing-form">
+      <h2>Sharing</h2>
+      <p class="hint">Choose who can see your dashboards. They can look, but only you can change your numbers.</p>
+      <div id="sharing-body"></div>
+      <div class="dialog-actions">
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn btn-primary" id="sharing-save" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Storage -->
+  <dialog id="storage" class="dialog wide">
+    <form method="dialog" id="storage-form">
+      <h2>Where should Goals keep data?</h2>
+      <label class="choice">
+        <input type="radio" name="mode" value="local">
+        <span><strong>This device only</strong><br>
+          <span class="muted">Quick and private. Several people can have profiles, but only on this browser.</span></span>
+      </label>
+      <label class="choice">
+        <input type="radio" name="mode" value="sheets">
+        <span><strong>Google Sheets</strong> (share between phones and computers)<br>
+          <span class="muted">Everyone uses the same Google Sheet through a small script you set up once.
+            See <code>apps-script/SETUP.md</code> in the Goals folder.</span></span>
+      </label>
+      <label class="field" id="sheets-url-field">
+        <span>Web app URL</span>
+        <input id="sheets-url" class="text-input" type="url" placeholder="https://script.google.com/macros/s/…/exec">
+        <span class="hint" id="sheets-test-result"></span>
+      </label>
+      <p class="hint">Switching signs you out. The first time you sign in to Google Sheets with the same name you use here, your numbers from this device are copied over automatically.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="sheets-test">Test connection</button>
+        <span class="spacer"></span>
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn btn-primary" id="storage-save" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="js/format.js"></script>
+  <script src="js/backends.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/charts.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/topics/monthlyBalance.js"></script>
+  <script>App.start();</script>
+</body>
+</html>
