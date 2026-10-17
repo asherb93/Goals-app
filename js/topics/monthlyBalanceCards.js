@@ -204,6 +204,7 @@
       // A new set of transactions (e.g. after "Adjust columns") gets fresh default ticks and suggestions;
       // only choices the person made themselves are kept.
       st.removeManual = {};
+      st.removeTouched = {};
       st.suggested = false;
       Object.keys(st.choices).forEach((k) => { if (!st.choices[k].touched) delete st.choices[k]; });
       st.step = txns.length ? 'preview' : 'pick';
@@ -284,7 +285,8 @@
       }
       const overlaps = manualOverlaps(fresh);
       st.removeManual = st.removeManual || {};
-      overlaps.forEach((o) => { if (!(o.id in st.removeManual)) st.removeManual[o.id] = o.kind === 'budget' || !!o.match; });
+      st.removeTouched = st.removeTouched || {};
+      overlaps.forEach((o) => { if (!st.removeTouched[o.id]) st.removeManual[o.id] = o.kind === 'budget' || !!o.match; });
       st.overlaps = overlaps;
       const label = st.analysis.profile.label;
       const card = st.analysis.meta.card || (fresh[0] && fresh[0].card) || '';
@@ -395,7 +397,7 @@
         row.querySelector('[data-remember]').onchange = (e) => { ch().remember = e.target.checked; ch().touched = true; };
       });
       view.querySelectorAll('[data-overlap]').forEach((box) => {
-        box.onchange = () => { st.removeManual[box.dataset.overlap] = box.checked; };
+        box.onchange = () => { st.removeManual[box.dataset.overlap] = box.checked; st.removeTouched[box.dataset.overlap] = true; };
       });
       view.querySelector('[data-import]').onclick = () => doImport(fresh);
     }

@@ -3,12 +3,15 @@
  *
  * Paste this whole file into Extensions → Apps Script of the Google Sheet you want to use,
  * then deploy it as a web app (see SETUP.md). The script runs as the sheet owner, so it
- * enforces who can read what: people only get their own data plus dashboards shared with them.
+ * enforces who can read and edit what: people get their own data plus the topics others shared with
+ * them, and can change another person's topic only when it was shared with "can edit".
+ * Saves carry the version they were based on; if someone saved in between, the save is refused with
+ * the newer version so the app can merge both people's changes and save again.
  *
  * Sheets it creates and maintains:
  *   Users   – one row per person (passcodes are stored as salted hashes)
  *   Data    – each person's app data as JSON (split across columns when large)
- *   Shares  – owner → viewer pairs (view-only)
+ *   Shares  – owner → viewer pairs, with per-topic access as JSON ({"food": "edit", ...}; empty = view all)
  *   Monthly Balance / Income / Targets / Expenses / Transactions / Leftover Plan – readable copies of everyone's numbers
  */
 
@@ -19,7 +22,13 @@ const CHUNK = 45000; // Sheets cells hold up to 50,000 characters
 const MAX_DATA = 1500000;
 const RESERVED = ['Users', 'Data', 'Shares'];
 const USERS = ['id', 'name', 'color', 'salt', 'pinHash', 'createdAt'];
-const SHARES = ['ownerId', 'viewerId', 'createdAt'];
+const SHARES = ['ownerId', 'viewerId', 'createdAt', 'access'];
+const LEVELS = ['view', 'edit'];
+// Readable tabs each topic writes, so someone editing one topic can't write another topic's tabs.
+const TOPIC_TABS = {
+  'monthly-balance': ['Monthly Balance', 'Income', 'Targets', 'Expenses', 'Transactions', 'Leftover Plan'],
+  'food': ['Groceries', 'Meal Plan'],
+};
 // Readable-tab columns that were renamed in a later app version, per tab: new name -> old names.
 const RENAMED_HEADERS = {
   'Monthly Balance': {
@@ -37,7 +46,7 @@ function headerAliases(tab, h) {
 }
 
 function doGet() {
-  return out({ ok: true, result: { app: 'goals', version: 1 } });
+  return out({ ok: true, result: { app: 'goals', version: 2 } });
 }
 
 function doPost(e) {
@@ -56,7 +65,7 @@ function doPost(e) {
 }
 
 const ACTIONS = {
-  ping: () => ({ app: 'goals', version: 1 }),
+  ping: () => ({ app: 'goals', version: 2 }),
 
   listUsers: () => users().map(publicUser),
 
@@ -97,49 +106,98 @@ const ACTIONS = {
 
   saveData: (req) => {
     const user = auth(req.token);
-    const json = JSON.stringify(req.data || {});
-    if (json.length > MAX_DATA) throw new Error('Your data is too large to save.');
-    const updatedAt = Date.now();
-    const parts = [];
-    // Each part gets a leading "j" so Sheets never reads it as a number, date or formula.
-    for (let i = 0; i < json.length; i += CHUNK) parts.push('j' + json.slice(i, i + CHUNK));
-    const sh = sheet('Data', ['userId', 'updatedAt', 'json']);
-    const ids = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().map((r) => r[0]) : [];
-    const idx = ids.indexOf(user.id);
-    const row = idx >= 0 ? idx + 2 : sh.getLastRow() + 1;
-    const width = 2 + parts.length;
-    if (sh.getMaxColumns() < width) sh.insertColumnsAfter(sh.getMaxColumns(), width - sh.getMaxColumns());
-    sh.getRange(row, 1, 1, sh.getMaxColumns()).clearContent();
-    writeText(sh.getRange(row, 1, 1, width), [[user.id, String(updatedAt)].concat(parts)]);
+    const rev = revOf(user.id);
+    if (req.baseRev != null && rev && rev !== Number(req.baseRev)) {
+      const cur = readData(user.id);
+      return { conflict: true, data: cur.data, updatedAt: cur.updatedAt };
+    }
+    const updatedAt = writeData(user.id, req.data || {}, rev);
     writeReadable(user, req.rows || {});
     return { updatedAt };
   },
 
   getSharing: (req) => {
     const user = auth(req.token);
-    const shares = rows('Shares', SHARES);
+    const all = shares();
+    const mine = all.filter((s) => s.ownerId === user.id);
+    const theirs = all.filter((s) => s.viewerId === user.id);
     return {
-      viewers: shares.filter((s) => s.ownerId === user.id).map((s) => s.viewerId),
-      sharedWithMe: shares.filter((s) => s.viewerId === user.id).map((s) => s.ownerId),
+      viewers: mine.map((s) => s.viewerId),
+      sharedWithMe: theirs.map((s) => s.ownerId),
+      access: Object.fromEntries(mine.map((s) => [s.viewerId, s.access])),
+      sharedAccess: Object.fromEntries(theirs.map((s) => [s.ownerId, s.access])),
     };
   },
 
+  // access: {viewerId: {topicId: 'view' | 'edit'}}; people left out (or with nothing) lose access.
+  setAccess: (req) => {
+    const user = auth(req.token);
+    const ids = new Set(users().map((u) => u.id));
+    const wanted = req.access && typeof req.access === 'object' ? req.access : {};
+    const now = new Date().toISOString();
+    const old = shares();
+    const created = (id) => (old.find((s) => s.ownerId === user.id && s.viewerId === id) || {}).createdAt || now;
+    const mine = Object.keys(wanted)
+      .filter((id) => id !== user.id && ids.has(id))
+      .map((viewerId) => ({ ownerId: user.id, viewerId, createdAt: created(viewerId), access: cleanAccess(wanted[viewerId]) }))
+      .filter((s) => Object.keys(s.access).length);
+    writeShares(old.filter((s) => s.ownerId !== user.id).concat(mine));
+    return { access: Object.fromEntries(mine.map((s) => [s.viewerId, s.access])) };
+  },
+
+  // From older app versions: keeps the per-topic access of people who stay; new people can view all.
   setViewers: (req) => {
     const user = auth(req.token);
     const ids = new Set(users().map((u) => u.id));
     const wanted = (req.viewerIds || []).filter((id) => id !== user.id && ids.has(id));
     const now = new Date().toISOString();
-    const kept = rows('Shares', SHARES).filter((s) => s.ownerId !== user.id);
-    const next = kept.concat(wanted.map((viewerId) => ({ ownerId: user.id, viewerId, createdAt: now })));
-    rewrite(sheet('Shares', SHARES), SHARES, next.map((s) => SHARES.map((k) => s[k])), true);
+    const old = shares();
+    const prev = (id) => old.find((s) => s.ownerId === user.id && s.viewerId === id);
+    const next = old.filter((s) => s.ownerId !== user.id).concat(wanted.map((viewerId) => (
+      prev(viewerId) || { ownerId: user.id, viewerId, createdAt: now, access: { '*': 'view' } })));
+    writeShares(next);
     return { viewers: wanted };
   },
 
   loadUserData: (req) => {
     const user = auth(req.token);
-    const shared = rows('Shares', SHARES).some((s) => s.ownerId === req.ownerId && s.viewerId === user.id);
-    if (!shared) throw err('This dashboard is not shared with you.', 'FORBIDDEN');
-    return readData(req.ownerId);
+    const share = shareFor(req.ownerId, user.id);
+    const cur = readData(req.ownerId);
+    return { data: visible(cur && cur.data, share.access), updatedAt: cur ? cur.updatedAt : null, access: share.access };
+  },
+
+  // topics: {topicId: data} for topics shared with this person as "can edit".
+  saveUserData: (req) => {
+    const user = auth(req.token);
+    const share = shareFor(req.ownerId, user.id);
+    const sent = req.topics && typeof req.topics === 'object' ? req.topics : {};
+    const ids = Object.keys(sent);
+    if (!ids.length) throw new Error('Nothing to save.');
+    if (ids.some((t) => levelOf(share.access, t) !== 'edit')) throw err('You can only view this, not edit it.', 'FORBIDDEN');
+    const owner = users().find((u) => u.id === req.ownerId);
+    if (!owner) throw err('That person no longer exists.', 'FORBIDDEN');
+    const cur = readData(owner.id);
+    if (req.baseRev != null && cur && cur.updatedAt !== Number(req.baseRev)) {
+      return { conflict: true, data: visible(cur.data, share.access), updatedAt: cur.updatedAt };
+    }
+    const next = cur && cur.data && typeof cur.data === 'object' ? cur.data : { version: 2, settings: { currency: 'ILS' }, topics: {} };
+    if (!next.topics || typeof next.topics !== 'object') next.topics = {};
+    ids.forEach((t) => { next.topics[t] = sent[t]; });
+    const updatedAt = writeData(owner.id, next, cur ? cur.updatedAt : 0);
+    const tabs = {};
+    ids.forEach((t) => (TOPIC_TABS[t] || []).forEach((name) => { if (req.rows && req.rows[name]) tabs[name] = req.rows[name]; }));
+    writeReadable(owner, tabs);
+    return { updatedAt };
+  },
+
+  // Latest save time of my data and of the people who share with me, to notice their changes.
+  revs: (req) => {
+    const user = auth(req.token);
+    const allowed = new Set([user.id].concat(shares().filter((s) => s.viewerId === user.id).map((s) => s.ownerId)));
+    const result = {};
+    [user.id].concat(Array.isArray(req.ids) ? req.ids : []).forEach((id) => { if (allowed.has(id)) result[id] = 0; });
+    dataRevs().forEach((r) => { if (r.id in result) result[r.id] = r.rev; });
+    return result;
   },
 };
 
@@ -192,8 +250,85 @@ function users() { return rows('Users', USERS); }
 
 function publicUser(u) { return { id: u.id, name: u.name, color: u.color, hasPin: true }; }
 
+// ---------- Data rows ----------
+
+function dataSheet() { return sheet('Data', ['userId', 'updatedAt', 'json']); }
+
+function dataRevs() {
+  const sh = dataSheet();
+  if (sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues().map((r) => ({ id: String(r[0]), rev: Number(r[1]) || 0 }));
+}
+
+function revOf(userId) {
+  const r = dataRevs().find((x) => x.id === userId);
+  return r ? r.rev : 0;
+}
+
+// Saves are versioned by time; a later save always gets a larger number, even within one millisecond.
+function writeData(userId, data, prevRev) {
+  const json = JSON.stringify(data || {});
+  if (json.length > MAX_DATA) throw new Error('This data is too large to save.');
+  const updatedAt = Math.max(Date.now(), (Number(prevRev) || 0) + 1);
+  const parts = [];
+  // Each part gets a leading "j" so Sheets never reads it as a number, date or formula.
+  for (let i = 0; i < json.length; i += CHUNK) parts.push('j' + json.slice(i, i + CHUNK));
+  const sh = dataSheet();
+  const ids = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().map((r) => r[0]) : [];
+  const idx = ids.indexOf(userId);
+  const row = idx >= 0 ? idx + 2 : sh.getLastRow() + 1;
+  const width = 2 + parts.length;
+  if (sh.getMaxColumns() < width) sh.insertColumnsAfter(sh.getMaxColumns(), width - sh.getMaxColumns());
+  sh.getRange(row, 1, 1, sh.getMaxColumns()).clearContent();
+  writeText(sh.getRange(row, 1, 1, width), [[userId, String(updatedAt)].concat(parts)]);
+  return updatedAt;
+}
+
+// ---------- Sharing ----------
+
+function cleanAccess(a) {
+  const result = {};
+  Object.keys(a && typeof a === 'object' ? a : {}).forEach((k) => {
+    if (/^([\w-]{1,40}|\*)$/.test(k) && LEVELS.indexOf(a[k]) >= 0) result[k] = a[k];
+  });
+  return result;
+}
+
+function parseAccess(text) {
+  let a = {};
+  try { a = cleanAccess(JSON.parse(text || '{}')); } catch (ignored) { a = {}; }
+  // Rows saved before per-topic sharing have no access: they meant "can view everything".
+  return Object.keys(a).length ? a : { '*': 'view' };
+}
+
+function levelOf(access, topic) { return (access && (access[topic] || access['*'])) || 'none'; }
+
+function shares() {
+  const sh = sheet('Shares', SHARES);
+  if (String(sh.getRange(1, 4).getValues()[0][0]) !== 'access') sh.getRange(1, 1, 1, SHARES.length).setValues([SHARES]).setFontWeight('bold');
+  return rows('Shares', SHARES).map((s) => Object.assign(s, { access: parseAccess(s.access) }));
+}
+
+function writeShares(list) {
+  rewrite(sheet('Shares', SHARES), SHARES, list.map((s) => [s.ownerId, s.viewerId, s.createdAt, JSON.stringify(s.access)]), true);
+}
+
+function shareFor(ownerId, viewerId) {
+  const share = shares().find((s) => s.ownerId === ownerId && s.viewerId === viewerId);
+  if (!share) throw err('This is not shared with you.', 'FORBIDDEN');
+  return share;
+}
+
+// Someone else's data as this viewer may see it: only the topics shared with them.
+function visible(data, access) {
+  const d = data && typeof data === 'object' ? data : {};
+  const topics = {};
+  Object.keys(d.topics || {}).forEach((t) => { if (levelOf(access, t) !== 'none') topics[t] = d.topics[t]; });
+  return { version: 2, settings: d.settings || {}, topics };
+}
+
 function readData(userId) {
-  const sh = sheet('Data', ['userId', 'updatedAt', 'json']);
+  const sh = dataSheet();
   if (sh.getLastRow() < 2) return null;
   const values = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getMaxColumns()).getValues();
   const row = values.find((r) => r[0] === userId);

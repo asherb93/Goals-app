@@ -1,18 +1,23 @@
 // App shell: sign-in, topic registry, hash router (#/<topic>/<input|dashboard>[/<personId>]),
-// people switcher, sharing, settings, storage, tooltip.
+// people switcher, sharing (per topic: can view / can edit), settings, storage, tooltip.
 (function () {
   const topics = [];
   const ui = {};             // per-topic view state on this device (e.g. selected month)
-  const othersCache = {};    // personId -> {blob, at}
-  const OTHERS_TTL = 60000;
+  const LEVEL_LABELS = { none: 'No access', view: 'Can view', edit: 'Can edit' };
   const AVATAR_COLORS = ['#2a78d6', '#eb6834', '#1baf7a', '#e87ba4', '#4a3aa7', '#008300', '#e34948', '#c98500'];
   const VIEWS = [{ id: 'input', label: 'Input' }, { id: 'dashboard', label: 'Dashboard' }];
   const { esc } = Fmt;
 
   let people = [];        // everyone with a profile in the current storage
-  let sharedWithMe = [];  // people whose dashboards I can see
-  let myViewers = [];     // ids of people who can see mine
+  let sharedWithMe = [];  // people who share at least one topic with me
+  let myViewers = [];     // ids of people I share at least one topic with
+  let myAccess = {};      // viewerId -> {topicId | '*': 'view' | 'edit'}
+  let sharedAccess = {};  // ownerId -> what they let me do, same shape
   let renderSeq = 0;
+  let remotePending = false;
+
+  const levelOf = (access, topicId) => (access && (access[topicId] || access['*'])) || 'none';
+  const levelFor = (personId, topicId) => levelOf(sharedAccess[personId], topicId);
 
   const $ = (id) => document.getElementById(id);
 
@@ -26,8 +31,15 @@
     const m = location.hash.match(/^#\/([\w-]+)\/(input|dashboard)(?:\/([\w-]+))?$/);
     const topic = (m && topics.find((t) => t.id === m[1])) || topics[0];
     const view = m && topic.id === m[1] ? m[2] : 'dashboard';
-    const person = view === 'dashboard' && m && m[3] && m[3] !== Store.me.id ? m[3] : null;
+    const person = m && topic.id === m[1] && m[3] && m[3] !== Store.me.id ? m[3] : null;
     return { topic, view, person };
+  }
+
+  // Whose data a link to this topic/view should open: the person on screen if they allow it, else mine.
+  function personFor(topic, view, person) {
+    if (!person) return null;
+    const level = levelFor(person, topic.id);
+    return (view === 'input' ? level === 'edit' : level !== 'none') ? person : null;
   }
 
   function href(topic, view, person) {
@@ -41,46 +53,55 @@
     const expected = href(topic, view, person);
     if (location.hash !== expected) history.replaceState(null, '', expected);
 
+    const label = (v, who) => esc((topic.labels && topic.labels[v.id])
+      || (who ? (v.id === 'input' ? 'Numbers' : 'Dashboard') : (v.id === 'input' ? 'My numbers' : 'My dashboard')));
     $('topic-nav').innerHTML = topics.map((t) =>
-      `<a href="${href(t, view)}"${t === topic ? ' aria-current="page"' : ''}>${esc(t.title)}</a>`).join('');
-    $('view-tabs').innerHTML = VIEWS.map((v) =>
-      `<a href="${href(topic, v.id)}"${v.id === view && !(v.id === 'dashboard' && person) ? ' aria-current="page"' : ''}>${v.id === 'input' ? 'My numbers' : 'My dashboard'}</a>`).join('');
+      `<a href="${href(t, view, personFor(t, view, person))}"${t === topic ? ' aria-current="page"' : ''}>${esc(t.title)}</a>`).join('');
+    $('view-tabs').innerHTML = VIEWS.map((v) => {
+      const who = personFor(topic, v.id, person);
+      return `<a href="${href(topic, v.id, who)}"${v.id === view && who === person ? ' aria-current="page"' : ''}>${label(v, who)}</a>`;
+    }).join('');
 
     const main = $('main');
     main.innerHTML = '';
     main.className = 'main';
     hideTooltip();
+    remotePending = false;
     document.title = `${topic.title} · Goals`;
     if (!ui[topic.id]) ui[topic.id] = { month: Fmt.monthKey(new Date()) };
 
-    if (view === 'dashboard') main.append(peopleBar(topic, person));
+    const editors = sharedWithMe.filter((p) => levelFor(p.id, topic.id) === 'edit');
+    if (view === 'dashboard' || editors.length) main.append(peopleBar(topic, view, person));
     const body = document.createElement('div');
     main.append(body);
+    Store.watch(person);
 
     if (!person) {
       Fmt.setCurrency(Store.settings.currency);
       const ctx = {
-        data: Store.topic(topic.id), isMe: true, readOnly: false, owner: Store.me, ui: ui[topic.id],
-        changed: () => Store.changed(), rerender: render,
+        data: Store.topic(topic.id), isMe: true, readOnly: false, owner: Store.me, ui: ui[topic.id], storage: Store.backend.mode,
+        inputHref: href(topic, 'input'), changed: () => Store.changed(), rerender: render,
       };
       view === 'input' ? topic.renderInput(body, ctx) : topic.renderDashboard(body, ctx);
       return;
     }
 
     const owner = sharedWithMe.find((p) => p.id === person);
-    if (!owner) {
-      body.innerHTML = `<section class="card empty-state"><p>This dashboard isn't shared with you.</p></section>`;
+    const level = levelFor(person, topic.id);
+    if (!owner || level === 'none') {
+      body.innerHTML = `<section class="card empty-state"><p>${owner ? `${esc(owner.name)} doesn't share ${esc(topic.title)} with you.` : "This isn't shared with you."}</p></section>`;
       return;
     }
-    let blob;
-    const cached = othersCache[person];
-    if (cached && Date.now() - cached.at < OTHERS_TTL) {
-      blob = cached.blob;
-    } else {
+    if (view === 'input' && level !== 'edit') {
+      body.innerHTML = `<section class="card empty-state"><p>${esc(owner.name)} shares ${esc(topic.title)} with you as view only.</p>
+        <a class="btn btn-primary" href="${href(topic, 'dashboard', person)}">See ${esc(owner.name)}'s ${esc(label({ id: 'dashboard' }, person).toLowerCase())}</a></section>`;
+      return;
+    }
+    let doc = Store.doc(person);
+    if (!doc || !doc.ready) {
       body.innerHTML = '<div class="loading">Loading…</div>';
       try {
-        blob = await Store.loadUser(person);
-        othersCache[person] = { blob, at: Date.now() };
+        doc = await Store.openDoc(person, sharedAccess[person]);
       } catch (e) {
         if (seq !== renderSeq) return;
         body.innerHTML = `<section class="card empty-state"><p>${esc(e.message)}</p><button class="btn" id="retry-other">Try again</button></section>`;
@@ -90,42 +111,83 @@
       if (seq !== renderSeq) return;
       body.innerHTML = '';
     }
-    Fmt.setCurrency(blob.settings.currency);
-    topic.renderDashboard(body, {
-      data: blob.topics[topic.id] || {}, isMe: false, readOnly: true, owner, ui: ui[topic.id],
-      changed() {}, rerender: render,
-    });
+    Fmt.setCurrency(doc.blob.settings.currency);
+    const ctx = {
+      data: level === 'edit' ? doc.topic(topic.id) : doc.blob.topics[topic.id] || {},
+      isMe: false, readOnly: level !== 'edit', owner, ui: ui[topic.id], storage: Store.backend.mode,
+      inputHref: href(topic, 'input', level === 'edit' ? person : null),
+      changed: level === 'edit' ? () => doc.changed() : () => {}, rerender: render,
+    };
+    view === 'input' ? topic.renderInput(body, ctx) : topic.renderDashboard(body, ctx);
   }
 
-  function peopleBar(topic, person) {
+  // On the dashboard: me + everyone who shares this topic with me. On the input screen: me + the
+  // people who let me edit it.
+  function peopleBar(topic, view, person) {
     const el = document.createElement('div');
     el.className = 'people-bar';
+    const level = person ? levelFor(person, topic.id) : 'edit';
+    const shown = sharedWithMe.filter((p) => (view === 'input' ? levelFor(p.id, topic.id) === 'edit' : levelFor(p.id, topic.id) !== 'none'));
     const pill = (p, isMe) => {
       const active = isMe ? !person : person === p.id;
-      return `<a class="person-pill${active ? ' active' : ''}" href="${href(topic, 'dashboard', isMe ? null : p.id)}"${active ? ' aria-current="page"' : ''}>
-        ${avatar(p, 'sm')}<span>${isMe ? 'Me' : esc(p.name)}</span></a>`;
+      const edit = !isMe && levelFor(p.id, topic.id) === 'edit';
+      return `<a class="person-pill${active ? ' active' : ''}" href="${href(topic, view, isMe ? null : p.id)}"${active ? ' aria-current="page"' : ''}
+          ${edit ? `title="${esc(p.name)} lets you edit ${esc(topic.title)}"` : ''}>
+        ${avatar(p, 'sm')}<span>${isMe ? 'Me' : esc(p.name)}</span>${edit ? '<span class="pill-edit" aria-label="(can edit)">✎</span>' : ''}</a>`;
     };
     el.innerHTML = `
-      <div class="people-pills">${pill(Store.me, true)}${sharedWithMe.map((p) => pill(p, false)).join('')}</div>
+      <div class="people-pills">${pill(Store.me, true)}${shown.map((p) => pill(p, false)).join('')}</div>
       <div class="people-actions">
-        ${person ? '<span class="view-only">View only</span><button class="btn btn-small" data-refresh>Refresh</button>' : ''}
-        <button class="btn btn-small" data-share>${myViewers.length ? `Shared with ${myViewers.length}` : 'Share my dashboard'}</button>
+        ${person ? `${level === 'edit'
+          ? `<span class="can-edit">✎ ${view === 'input' ? `Editing ${esc((sharedWithMe.find((p) => p.id === person) || {}).name || '')}'s ${esc(topic.title)}` : 'You can edit this'}</span>`
+          : '<span class="view-only">View only</span>'}<button class="btn btn-small" data-refresh>Refresh</button>` : ''}
+        <button class="btn btn-small" data-share>${myViewers.length ? `Shared with ${myViewers.length}` : 'Share'}</button>
       </div>`;
     el.querySelector('[data-share]').onclick = openSharing;
     const refresh = el.querySelector('[data-refresh]');
-    if (refresh) refresh.onclick = () => { delete othersCache[person]; render(); };
+    if (refresh) {
+      refresh.onclick = async () => {
+        refresh.disabled = true;
+        const doc = Store.doc(person);
+        try { if (doc) await doc.refresh(); } catch (e) { toast(e.message); }
+        render();
+      };
+    }
     return el;
   }
 
   async function refreshPeople() {
     try {
       const [all, sharing] = await Promise.all([Store.listUsers(), Store.getSharing()]);
+      const before = JSON.stringify([myAccess, sharedAccess]);
       people = all;
-      myViewers = sharing.viewers;
-      sharedWithMe = all.filter((p) => sharing.sharedWithMe.includes(p.id));
+      myAccess = sharing.access;
+      sharedAccess = sharing.sharedAccess;
+      myViewers = Object.keys(myAccess);
+      sharedWithMe = all.filter((p) => sharedAccess[p.id]);
+      sharedWithMe.forEach((p) => { const d = Store.doc(p.id); if (d) d.access = sharedAccess[p.id]; });
+      Store.setCollab(Object.values(myAccess).some((a) => Object.values(a).includes('edit')));
+      return before !== JSON.stringify([myAccess, sharedAccess]);
     } catch (e) {
       // Keep whatever we had; the dashboard still works for the signed-in person.
+      return false;
     }
+  }
+
+  // Someone else's changes were merged into the data on screen: redraw, but not under someone typing.
+  const typing = () => {
+    const a = document.activeElement;
+    return !!a && $('main').contains(a) && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && !/^(checkbox|radio|button)$/.test(a.type)));
+  };
+  function remoteRender() {
+    if (typing()) { remotePending = true; return; }
+    render();
+    toast('Updated with the latest saved changes.');
+  }
+  function onRemote(doc) {
+    if (!Store.me) return;
+    const { person } = route();
+    if (person ? doc === Store.doc(person) : doc.mine) remoteRender();
   }
 
   // ---------- Sign-in screen ----------
@@ -236,6 +298,7 @@
 
   async function enterApp() {
     showScreen('app');
+    remotePending = false;
     $('user-btn').innerHTML = `${avatar(Store.me, 'sm')}<span class="user-name">${esc(Store.me.name)}</span><span aria-hidden="true">▾</span>`;
     $('menu-head').innerHTML = `${avatar(Store.me)}<div><strong>${esc(Store.me.name)}</strong><div class="muted">${esc(Store.backend.label)}</div></div>`;
     updateSync(Store.status);
@@ -255,8 +318,7 @@
 
   function signOut(message) {
     Store.signOut();
-    people = []; sharedWithMe = []; myViewers = [];
-    Object.keys(othersCache).forEach((k) => delete othersCache[k]);
+    people = []; sharedWithMe = []; myViewers = []; myAccess = {}; sharedAccess = {};
     Object.keys(ui).forEach((k) => delete ui[k]);
     history.replaceState(null, '', '#/');
     showAuth(message);
@@ -309,21 +371,29 @@
     await refreshPeople();
     const others = people.filter((p) => p.id !== Store.me.id);
     const sheets = Store.backend.mode === 'sheets';
+    const select = (p, t) => {
+      const level = levelOf(myAccess[p.id], t.id);
+      return `<select class="select access-select" data-viewer="${esc(p.id)}" data-topic="${esc(t.id)}" aria-label="${esc(p.name)}: ${esc(t.title)}">
+        ${Object.keys(LEVEL_LABELS).map((l) => `<option value="${l}"${l === level ? ' selected' : ''}>${LEVEL_LABELS[l]}</option>`).join('')}</select>`;
+    };
+    const theirs = (p) => topics.map((t) => ({ t, level: levelFor(p.id, t.id) })).filter((x) => x.level !== 'none');
     body.innerHTML = `
       ${others.length ? `
-        <h3 class="dialog-sub">Who can see my dashboards</h3>
-        <div class="share-list">
-          ${others.map((p) => `
-            <label class="share-row">${avatar(p)}<span class="grow">${esc(p.name)}</span>
-              <input type="checkbox" class="switch" value="${esc(p.id)}"${myViewers.includes(p.id) ? ' checked' : ''}></label>`).join('')}
-        </div>` : `
+        <h3 class="dialog-sub">What others can see and change</h3>
+        <p class="hint">“Can edit” lets them change that topic, e.g. plan meals or tick groceries with you. Changes you both make are merged when they're saved.</p>
+        <div class="table-scroll"><table class="access-table">
+          <thead><tr><th scope="col">Person</th>${topics.map((t) => `<th scope="col">${esc(t.title)}</th>`).join('')}</tr></thead>
+          <tbody>${others.map((p) => `<tr><th scope="row"><span class="share-person">${avatar(p)}<span>${esc(p.name)}</span></span></th>
+            ${topics.map((t) => `<td>${select(p, t)}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table></div>` : `
         <p class="empty">Nobody else has a profile yet. ${sheets
           ? 'Send them the web app URL below; they open Goals, choose Google Sheets storage, paste it and add themselves.'
           : 'They can add themselves from the sign-in screen (Switch person → Add person).'}</p>`}
       <h3 class="dialog-sub">Shared with me</h3>
       ${sharedWithMe.length
-        ? `<div class="share-list">${sharedWithMe.map((p) => `<div class="share-row">${avatar(p)}<span class="grow">${esc(p.name)}</span><span class="muted">can view</span></div>`).join('')}</div>`
-        : '<p class="empty">Nobody has shared their dashboard with you yet.</p>'}
+        ? `<div class="share-list">${sharedWithMe.map((p) => `<div class="share-row">${avatar(p)}<span class="grow">${esc(p.name)}</span>
+            <span class="muted share-levels">${theirs(p).map((x) => `${esc(x.t.title)}: ${x.level === 'edit' ? '<strong>can edit</strong>' : 'can view'}`).join(' · ')}</span></div>`).join('')}</div>`
+        : '<p class="empty">Nobody has shared anything with you yet.</p>'}
       ${sheets ? `
         <h3 class="dialog-sub">Invite family</h3>
         <div class="inline-row"><input class="text-input grow" readonly value="${esc(Store.device.backend.url)}" id="invite-url">
@@ -337,12 +407,18 @@
   function initSharing() {
     $('sharing-save').addEventListener('click', async (e) => {
       e.preventDefault();
-      const ids = Array.from($('sharing-body').querySelectorAll('input[type=checkbox]:checked'), (c) => c.value);
+      const access = {};
+      $('sharing-body').querySelectorAll('.access-select').forEach((sel) => {
+        if (sel.value === 'none') return;
+        (access[sel.dataset.viewer] = access[sel.dataset.viewer] || {})[sel.dataset.topic] = sel.value;
+      });
       const btn = $('sharing-save');
       btn.disabled = true;
       try {
-        await Store.setViewers(ids);
-        myViewers = ids;
+        await Store.setAccess(access);
+        myAccess = access;
+        myViewers = Object.keys(access);
+        Store.setCollab(Object.values(access).some((a) => Object.values(a).includes('edit')));
         $('sharing').close();
         render();
       } catch (err) {
@@ -511,9 +587,18 @@
       initSettings();
       initTooltip();
       Store.onStatus(updateSync);
+      Store.onRemote(onRemote);
       Store.onAuthLost = () => signOut('Please sign in again.');
       Store.rowsProvider = (blob) => Object.assign({}, ...topics.map((t) => (t.exportRows ? t.exportRows(blob.topics[t.id]) : {})));
+      Store.topicRowsProvider = (id, data) => { const t = topics.find((x) => x.id === id); return t && t.exportRows ? t.exportRows(data) : {}; };
       addEventListener('hashchange', render);
+      // A remote update that waited for typing to finish.
+      $('main').addEventListener('focusout', () => setTimeout(() => { if (remotePending && !typing()) remoteRender(); }, 250));
+      // Coming back to the app: pick up sharing changes (e.g. someone just let me edit their Food).
+      document.addEventListener('visibilitychange', async () => {
+        if (document.hidden || !Store.me) return;
+        if (await refreshPeople()) render();
+      });
 
       if (!Store.hasSession()) return showAuth();
       try {

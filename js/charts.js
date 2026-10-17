@@ -129,7 +129,7 @@
   // Stacked columns over time. points: {label, segments: [{name, value, color}], marker?, tip, tipSub, selected, note?}
   // width/height: the box to draw into, in px, so labels stay true size when a card is resized.
   function columns(points, { legendItems, ariaLabel, tableHeaders, tableRows, width, height }) {
-    const W = Math.max(320, Math.round(width || 640)), H = Math.max(110, Math.round(height || 240));
+    const W = Math.max(320, Math.round(width || 640)), H = Math.max(height ? 80 : 110, Math.round(height || 240));
     const padL = 52, padR = 8, padT = 26, padB = 28;
     const max = Math.max(1, ...points.map((p) => Math.max(sum(p.segments.map((s) => s.value)), p.marker || 0)));
     const ticks = niceTicks(max, 4);
@@ -171,7 +171,8 @@
   }
 
   // Target vs actual per row: the bar is actual, the dashed tick is the target. items: {name, actual, planned, color}
-  function bulletList(items, { empty, planLabel = 'Target', noPlan = 'No target', limit }) {
+  // format: how values are written (money by default; e.g. grams or kcal for food).
+  function bulletList(items, { empty, planLabel = 'Target', noPlan = 'No target', limit, format = money }) {
     // Rows with a target first (that's the comparison people came for), then by size.
     const all = items.filter((i) => i.actual > 0 || i.planned > 0)
       .sort((a, b) => (b.planned > 0) - (a.planned > 0) || Math.max(b.actual, b.planned) - Math.max(a.actual, a.planned));
@@ -182,8 +183,8 @@
       if (i.status) return { text: i.status, cls: 'muted' };
       if (!i.planned) return { text: noPlan, cls: 'muted' };
       const d = i.actual - i.planned;
-      if (d > 0.005) return { text: `⚠ ${money(d)} over`, cls: 'negative' };
-      return { text: `${money(-d)} left`, cls: 'muted' };
+      if (d > 0.005) return { text: `⚠ ${format(d)} over`, cls: 'negative' };
+      return { text: `${format(-d)} left`, cls: 'muted' };
     };
     return `
       ${legend([{ name: 'Actual', color: 'var(--ink-2)' }, { name: planLabel, color: 'var(--ink)', dashed: true }], 'legend-inline')}
@@ -191,19 +192,19 @@
         ${shown.map((i) => {
           const s = status(i);
           return `
-          <div class="bullet-row" ${tipAttrs(i.name, i.status ? `${planLabel} ${money(i.planned)} · ${i.status}` : `Actual ${money(i.actual)} · ${planLabel} ${i.planned ? money(i.planned) : '–'}`)}>
+          <div class="bullet-row" ${tipAttrs(i.name, i.status ? `${planLabel} ${format(i.planned)} · ${i.status}` : `Actual ${format(i.actual)} · ${planLabel} ${i.planned ? format(i.planned) : '–'}`)}>
             <span class="bar-name"><span class="swatch" style="background:${i.color}"></span> <span dir="auto">${esc(i.name)}</span></span>
             <span class="bullet-track">
               ${i.actual > 0 ? `<span class="bar" style="width:${(i.actual / max) * 100}%;background:${i.color}"></span>` : ''}
               ${i.planned ? `<span class="bullet-plan" style="left:${(i.planned / max) * 100}%"></span>` : ''}
             </span>
-            <span class="bullet-values"><strong>${money(i.actual)}</strong><span class="muted"> / ${i.planned ? money(i.planned) : '–'}</span>
+            <span class="bullet-values"><strong>${format(i.actual)}</strong><span class="muted"> / ${i.planned ? format(i.planned) : '–'}</span>
               <span class="bullet-status ${s.cls}">${esc(s.text)}</span></span>
           </div>`;
         }).join('')}
       </div>
       ${moreNote(all.length - shown.length)}
-      ${table(['Category', 'Actual', planLabel, 'Difference'], all.map((i) => [i.name, i.status ? '–' : money(i.actual), i.planned ? money(i.planned) : '–', i.status || (i.planned ? money(i.actual - i.planned) : '–')]))}`;
+      ${table(['Category', 'Actual', planLabel, 'Difference'], all.map((i) => [i.name, i.status ? '–' : format(i.actual), i.planned ? format(i.planned) : '–', i.status || (i.planned ? format(i.actual - i.planned) : '–')]))}`;
   }
 
   window.Charts = { table, legend, stackBar, barList, bulletList, donut, columns };

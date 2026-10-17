@@ -99,7 +99,8 @@
 
   function topicData(ctx) {
     const d = ctx.data;
-    if (ctx.isMe) {
+    // Editable: my own data, or someone else's topic shared with me as "can edit".
+    if (ctx.readOnly === undefined ? ctx.isMe : !ctx.readOnly) {
       if (!d.months) d.months = {};
       if (!d.categories || d.catsVersion !== 2) { d.categories = migratedCategories(d.categories); d.catsVersion = 2; }
       if (!d.transactions) d.transactions = [];
@@ -110,7 +111,7 @@
       if ((d.modelVersion || 0) < MODEL_VERSION) { migrateMonths(d, d.modelVersion || 0); d.modelVersion = MODEL_VERSION; }
       return d;
     }
-    // Someone else's (read-only) data: never mutate it; migrate a copy if it's from an older version.
+    // Read-only data (shared as view only, or for the sheet): never mutate it; migrate a copy if it's older.
     const td = {
       months: d.months || {},
       categories: d.catsVersion === 2 ? d.categories : migratedCategories(d.categories),
@@ -223,8 +224,15 @@
     const targetedIds = new Set(countedTargets.filter((t) => known(td, t.category)).map((t) => t.category));
     const targetedTarget = sum(countedTargets.filter((t) => targetedIds.has(t.category)).map((t) => t.amount));
     const targetedSpent = sum([...targetedIds].map((id) => byCategory.get(id) || 0));
+    // Per targeted category: its target, its spending, and the part of it entered by hand.
+    const targetPairs = new Map([...targetedIds].map((id) => [id, {
+      target: sum(countedTargets.filter((t) => t.category === id).map((t) => t.amount)),
+      actual: byCategory.get(id) || 0,
+      linesActual: sum(countedLines.filter((l) => known(td, l.category) && l.category === id).map((l) => l.amount)),
+    }]));
     const left = income - totalExpenses;
     return {
+      targetPairs,
       incomes, income, targets, countedTargets, targetTotal, hasTargets: targetTotal > 0,
       targetedTarget, targetedSpent, untargetedSpent: totalExpenses - targetedSpent,
       overTarget: targetedTarget > 0 && targetedSpent > targetedTarget + 0.005,
@@ -305,7 +313,10 @@
         ? `${a.getDate()}–${b.getDate()} ${SHORT_MONTHS[a.getMonth()]} ${b.getFullYear()}`
         : `${a.getDate()} ${SHORT_MONTHS[a.getMonth()]} – ${b.getDate()} ${SHORT_MONTHS[b.getMonth()]} ${b.getFullYear()}`;
       return {
-        kind, id: isoDay(a), label, short: `${a.getDate()} ${SHORT_MONTHS[a.getMonth()]}`, inLabel: `${a.getDate()}–${b.getDate()} ${SHORT_MONTHS[b.getMonth()]}`,
+        kind, id: isoDay(a), label, short: `${a.getDate()} ${SHORT_MONTHS[a.getMonth()]}`,
+        inLabel: a.getMonth() === b.getMonth()
+          ? `${a.getDate()}–${b.getDate()} ${SHORT_MONTHS[b.getMonth()]}`
+          : `${a.getDate()} ${SHORT_MONTHS[a.getMonth()]} – ${b.getDate()} ${SHORT_MONTHS[b.getMonth()]}`,
         start: isoDay(a), end: isoDay(b),
         parts: Object.keys(counts).sort().map((k) => ({ key: k, w: counts[k] / daysIn(k) })),
       };
@@ -332,19 +343,67 @@
     return [...out.values()];
   }
 
+  // Which month a purchase belongs to in a week view: the day it was made, except installments and
+  // standing orders, whose rows all carry the original purchase date and are really charged monthly.
+  const spentOn = (t) => (t.kind === 'installment' || t.kind === 'standing' ? t.chargeDate : t.date);
+
   function computePeriod(td, p) {
     if (p.kind === 'month') return { ...compute(td, p.id), period: p };
-    const cs = p.parts.map((x) => ({ c: compute(td, x.key), w: x.w }));
+    const cs = p.parts.map((x) => ({ key: x.key, c: compute(td, x.key), w: x.w }));
     const pick = (field) => cs.map(({ c, w }) => ({ rows: c[field], w }));
     const lower = (v) => String(v || '').toLowerCase();
     const incomes = mergeScaled(pick('incomes'), (x) => lower(x.label));
     const targets = mergeScaled(pick('targets'), (t) => `${lower(t.label)}|${t.category || ''}`);
     const lines = mergeScaled(pick('lines'), (l) => `${lower(l.label)}|${l.method}|${l.category || ''}`);
     const txns = p.kind === 'week'
-      ? td.transactions.filter((t) => t.date >= p.start && t.date <= p.end).map((t) => ({ ...t, cat: txnCategory(td, t).id }))
+      ? td.transactions.filter((t) => spentOn(t) >= p.start && spentOn(t) <= p.end).map((t) => ({ ...t, cat: txnCategory(td, t).id }))
       : cs.flatMap(({ c }) => c.txns);
-    const allocs = mergeScaled(pick('allocs'), (a) => lower(a.label));
-    return { m: null, ...withAllocs(tally(td, incomes, targets, lines, txns), allocs), period: p };
+    const base = tally(td, incomes, targets, lines, txns);
+
+    // Targets are compared month by month: a category's spending only counts against its target in
+    // the months (or, for a week, the days) that had one.
+    const pairs = new Map();
+    const addPair = (cat, target, actual) => {
+      const cur = pairs.get(cat) || { target: 0, actual: 0 };
+      cur.target += target;
+      cur.actual += actual;
+      pairs.set(cat, cur);
+    };
+    cs.forEach(({ c, w }) => c.targetPairs.forEach((v, cat) => {
+      if (p.kind === 'week') addPair(cat, v.target * w, v.linesActual * w);
+      else addPair(cat, v.target, v.actual);
+    }));
+    if (p.kind === 'week') {
+      base.counted.forEach((t) => {
+        const part = cs.find((x) => x.key === spentOn(t).slice(0, 7));
+        if (part && part.c.targetPairs.has(t.cat)) addPair(t.cat, 0, t.amount);
+      });
+    }
+    const targetedTarget = sum([...pairs.values()].map((v) => v.target));
+    const targetedSpent = sum([...pairs.values()].map((v) => v.actual));
+    Object.assign(base, {
+      targetPairs: pairs, targetedTarget, targetedSpent, untargetedSpent: base.totalExpenses - targetedSpent,
+      overTarget: targetedTarget > 0 && targetedSpent > targetedTarget + 0.005,
+    });
+
+    // Leftover plan: a year adds up its months. A week takes fixed amounts by its share of days, and
+    // applies "% of leftover" to the week's own leftover (weighted by how many of its days are in each month).
+    let allocs;
+    if (p.kind === 'week') {
+      const byName = new Map();
+      cs.forEach(({ key: k, c, w }) => c.allocs.forEach((a) => {
+        const name = lower(a.label);
+        const cur = byName.get(name) || { ...a, fixed: 0, share: 0 };
+        if (a.mode === 'percent') cur.share += (w * daysIn(k) / 7) * num(a.value);
+        else cur.fixed += a.amount * w;
+        byName.set(name, cur);
+      }));
+      allocs = [...byName.values()].map((a) => ({ ...a, amount: a.fixed + base.pool * a.share / 100 }));
+    } else {
+      allocs = mergeScaled(pick('allocs'), (a) => lower(a.label));
+    }
+    allocs.forEach((a, i) => { a.color = ALLOC_COLORS[i] || 'var(--other)'; });
+    return { m: null, ...withAllocs(base, allocs), period: p };
   }
 
   // Has anything been entered or imported for this period?
@@ -399,7 +458,7 @@
 
   // Readable rows written to the Google Sheet next to the raw data.
   function exportRows(data) {
-    const td = topicData({ data: data || {}, isMe: false });
+    const td = topicData({ data: data || {}, isMe: false, readOnly: true });
     const keys = monthKeys(td);
     const r2 = (n) => Math.round(n * 100) / 100;
     const catName = (id) => (known(td, id) ? categoryName(td, id) : 'No category');
@@ -569,27 +628,37 @@
       const c = compute(td, key, m);
       const free = c.counted.filter((t) => t.amount > 0).map((t) => ({ t, used: false }));
       const cats = new Set(c.counted.map((t) => t.cat).filter(Boolean));
-      const keep = [], covered = [], budgets = [];
-      rows.forEach((x) => {
-        if (x.method === 'card' && !isExcluded(td, x.category)) {
-          const amount = num(x.amount);
-          const same = (u) => !u.used && Math.abs(u.t.amount - amount) < 0.005;
-          // A purchase in the same category first; a purchase in a different known category isn't the same thing.
-          const hit = amount > 0 && (free.find((u) => same(u) && u.t.cat && u.t.cat === x.category)
-            || free.find((u) => same(u) && (!x.category || !u.t.cat)));
-          if (hit) { hit.used = true; covered.push(x); return; }
-        } else if (x.method !== 'card' && x.guessed && x.category && cats.has(x.category) && !isExcluded(td, x.category)) {
-          budgets.push(x);
-          return;
-        }
-        keep.push(x);
+      const keep = [], covered = new Set(), budgets = [];
+      const cards = rows.filter((x) => x.method === 'card' && !isExcluded(td, x.category) && num(x.amount) > 0);
+      const same = (u, x) => !u.used && Math.abs(u.t.amount - num(x.amount)) < 0.005;
+      // Pass 1: purchases in the row's own category. Pass 2: the rest, where either side has no
+      // category (a purchase in a different known category isn't the same thing).
+      cards.forEach((x) => {
+        const hit = x.category && free.find((u) => same(u, x) && u.t.cat === x.category);
+        if (hit) { hit.used = true; covered.add(x); }
       });
-      return { keep, covered, budgets };
+      cards.filter((x) => !covered.has(x)).forEach((x) => {
+        const hit = free.find((u) => same(u, x) && (!x.category || !u.t.cat));
+        if (hit) { hit.used = true; covered.add(x); }
+      });
+      rows.forEach((x) => {
+        if (covered.has(x)) return;
+        if (x.method !== 'card' && x.guessed && x.category && cats.has(x.category) && !isExcluded(td, x.category)) budgets.push(x);
+        else keep.push(x);
+      });
+      return { keep, covered: rows.filter((x) => covered.has(x)), budgets };
     }
 
-    // A guessed line becomes a target only if the month has no target in its category yet.
-    const newBudgets = (budgets) => budgets.filter((x, i) => !m.targets.some((t) => t.category === x.category && num(t.amount) > 0)
-      && budgets.findIndex((y) => y.category === x.category) === i).map(asTarget);
+    // Guessed lines become one target per category (amounts added up), unless the month already has one.
+    const newBudgets = (budgets) => {
+      const byCat = new Map();
+      budgets.forEach((x) => {
+        if (m.targets.some((t) => t.category === x.category && num(t.amount) > 0)) return;
+        const cur = byCat.get(x.category);
+        if (cur) { cur.amount = num(cur.amount) + num(x.amount); cur.name = ''; } else byCat.set(x.category, asTarget(x));
+      });
+      return [...byCat.values()];
+    };
 
     // ↻ rows from the latest earlier month that has real ones, minus what this month already has.
     function repeatCandidates(kind, method) {
@@ -597,8 +666,12 @@
         && (!method || (x.method === 'card' ? 'card' : 'direct') === method);
       const month = earlier.slice().reverse().find((k) => (td.months[k][kind] || []).some(real));
       if (!month) return { month: null, rows: [], covered: [], budgets: [] };
-      const current = kind === 'incomes' ? m.incomes.filter((x) => !isBlankIncome(x)) : m[kind];
-      const rows = notYetIn(current, td.months[month][kind].filter(real));
+      const blankExpense = (x) => !norm(x.name) && !x.category && num(x.amount) <= 0;
+      const current = kind === 'incomes' ? m.incomes.filter((x) => !isBlankIncome(x)) : m[kind].filter((x) => !blankExpense(x));
+      // Pair against every ↻ row of that month (both methods), then keep only this button's method,
+      // so a direct row never "uses up" a card row of the same name.
+      const all = td.months[month][kind].filter((x) => x.repeat && (kind !== 'incomes' || !isBlankIncome(x)));
+      const rows = notYetIn(current, all).filter(real);
       if (kind !== 'expenses') return { month, rows, covered: [], budgets: [] };
       const split = splitCovered(rows);
       return { month, rows: split.keep, covered: split.covered, budgets: newBudgets(split.budgets) };
@@ -1186,16 +1259,18 @@
 
   function targetVsActual(td, c) {
     const actual = actualByCategory(td, c);
-    const target = new Map();
-    c.countedTargets.filter((t) => known(td, t.category))
-      .forEach((t) => target.set(t.category, (target.get(t.category) || 0) + t.amount));
-    const ids = new Set([...actual.keys(), ...target.keys()]);
-    const items = [...ids].map((id) => ({
-      name: id ? categoryName(td, id) : uncategorizedLabel(c),
-      actual: actual.get(id) || 0,
-      planned: target.get(id) || 0,
-      color: id ? categoryColor(td, id) : 'var(--neutral)',
-    })).filter((i) => i.actual > 0 || i.planned > 0);
+    const pairs = c.targetPairs;
+    const ids = new Set([...actual.keys(), ...pairs.keys()]);
+    const items = [...ids].map((id) => {
+      const pair = pairs.get(id);
+      return {
+        name: id ? categoryName(td, id) : uncategorizedLabel(c),
+        // A targeted category is compared on the months that had its target (all of them, for a month view).
+        actual: pair ? pair.actual : actual.get(id) || 0,
+        planned: pair ? pair.target : 0,
+        color: id ? categoryColor(td, id) : 'var(--neutral)',
+      };
+    }).filter((i) => i.actual > 0 || i.planned > 0);
     // Targets without a category keep their own row so they don't silently disappear.
     c.uncategorizedTargets.forEach((t) => items.push({
       name: t.label, actual: 0, planned: t.amount, color: 'var(--neutral)', status: 'Choose a category to compare',
@@ -1255,9 +1330,14 @@
       const base = note ? Number(note.dataset.more) || 0 : 0;
       let hidden = 0;
       if (dash.classList.contains('fit') && !body.closest('.show-table')) {
-        const noteH = 22;
-        const bottom = body.getBoundingClientRect().bottom - noteH;
-        for (let i = rows.length - 1; i > 0 && rows[i].getBoundingClientRect().bottom > bottom; i--) { rows[i].hidden = true; hidden += 1; }
+        const end = body.getBoundingClientRect().bottom;
+        const last = rows[rows.length - 1];
+        // Room for the "+N more" line is only needed when there's something to count.
+        const fits = last && last.getBoundingClientRect().bottom <= end - (base ? 22 : 0) + 0.5;
+        if (!fits) {
+          const bottom = end - 22;
+          for (let i = rows.length - 1; i > 0 && rows[i].getBoundingClientRect().bottom > bottom; i--) { rows[i].hidden = true; hidden += 1; }
+        }
       }
       if (note) {
         note.textContent = `+${base + hidden} more in the table view`;
@@ -1299,16 +1379,24 @@
     el.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
+      ctx.ui.focusPeriod = btn.dataset.kind ? `[data-kind="${btn.dataset.kind}"]` : btn.dataset.step ? `[data-step="${btn.dataset.step}"]` : 'h1';
       if (btn.dataset.kind) {
         ctx.ui.period = btn.dataset.kind;
         ctx.rerender();
         return;
       }
-      const next = btn.hasAttribute('data-today') ? here : shiftPeriod(p, Number(btn.dataset.step));
+      const today = btn.hasAttribute('data-today');
+      const next = today ? here : shiftPeriod(p, Number(btn.dataset.step));
       // The month stays in step so "My numbers" opens on the same time.
-      if (next.kind === 'week') { ctx.ui.week = next.id; ctx.ui.month = next.parts[next.parts.length - 1].key; }
-      else if (next.kind === 'year') ctx.ui.month = next.id === here.id && btn.hasAttribute('data-today') ? Fmt.monthKey(now) : `${next.id}-${ctx.ui.month.slice(5, 7)}`;
+      if (today) ctx.ui.month = Fmt.monthKey(now);
+      else if (next.kind === 'week') {
+        // Keep the month if the week still touches it, else the month holding most of the week.
+        if (!next.parts.some((x) => x.key === ctx.ui.month)) {
+          ctx.ui.month = next.parts.slice().sort((x, y) => y.w * daysIn(y.key) - x.w * daysIn(x.key))[0].key;
+        }
+      } else if (next.kind === 'year') ctx.ui.month = `${next.id}-${ctx.ui.month.slice(5, 7)}`;
       else ctx.ui.month = next.id;
+      if (next.kind === 'week') ctx.ui.week = next.id;
       ctx.rerender();
     });
     return el;
@@ -1336,6 +1424,11 @@
     const p = currentPeriod(ctx);
     // The period picker shares the row with the people switcher to save height.
     const bar = periodBar(ctx, p);
+    if (ctx.ui.focusPeriod) {
+      const el = bar.querySelector(ctx.ui.focusPeriod) || bar.querySelector('h1');
+      ctx.ui.focusPeriod = null;
+      if (el) { if (el.tagName === 'H1') el.tabIndex = -1; setTimeout(() => el.focus(), 0); }
+    }
     const people = root.parentElement && root.parentElement.querySelector('.people-bar');
     if (people) people.prepend(bar); else root.append(bar);
     const main = root.closest('.main');
@@ -1351,7 +1444,7 @@
         <section class="card empty-state">
           <div class="empty-illustration" aria-hidden="true">₪</div>
           <p>${ctx.isMe ? 'No numbers' : `${esc(ctx.owner.name)} hasn't added numbers`} for ${esc(p.label)} yet.</p>
-          ${ctx.isMe ? `<a class="btn btn-primary" href="#/${ID}/input">Enter ${p.kind === 'month' ? "this month's" : 'your'} numbers</a>` : ''}
+          ${!ctx.readOnly ? `<a class="btn btn-primary" href="${ctx.inputHref || `#/${ID}/input`}">Enter ${p.kind === 'month' ? "this month's" : ctx.isMe ? 'your' : 'the'} numbers</a>` : ''}
         </section>
         ${monthKeys(td).length ? `<section class="card empty-trend">${cardHead('▥', LEFT_COLOR, 'Expenses vs money left')}<div class="chart-body"></div></section>` : ''}`;
       const body = view.querySelector('.empty-trend .chart-body');
@@ -1362,7 +1455,7 @@
     const sources = c.incomes.filter((x) => x.amount);
     const flags = [];
     if (c.left >= 0 && c.unallocated < -0.005) flags.push(`<span class="flag bad">⚠ Leftover plan is ${esc(money(-c.unallocated))} over</span>`);
-    if (ctx.isMe && c.needsCategory) flags.push(`<a class="flag" href="#/${ID}/input" data-review>💳 ${c.needsCategory} to categorize</a>`);
+    if (!ctx.readOnly && c.needsCategory) flags.push(`<a class="flag" href="${ctx.inputHref || `#/${ID}/input`}" data-review>💳 ${c.needsCategory} to categorize</a>`);
     if (p.kind === 'week') flags.push(`<span class="flag info" tabindex="0" data-tip="How a week is counted" data-tip-sub="Card purchases count on the day they were made. Income, targets, other expenses and the leftover plan are monthly, so the week gets its share by days.">ⓘ Monthly amounts split by days</span>`);
 
     const flow = Charts.stackBar([
@@ -1374,7 +1467,7 @@
     view.className = 'dash';
     view.innerHTML = `
       <div class="kpi-row">
-        ${kpi(esc(Fmt.currencySymbol()), 'var(--s6)', 'Income', money(c.income), sources.length > 1 ? `${sources.length} sources` : `This ${p.kind}`,
+        ${kpi(esc(Fmt.currencySymbol()), 'var(--s6)', 'Income', money(c.income), sources.length > 1 ? `${sources.length} sources` : esc(p.label),
           { tip: sources.map((x) => `${x.label} ${money(x.amount)}`).join(' · ') })}
         ${kpi('↓', EXPENSE_COLOR, 'Expenses', money(c.totalExpenses), `🏦 ${esc(money(c.direct))} · 💳 ${esc(money(c.card))}`,
           { tip: `Direct ${money(c.direct)} · Card ${money(c.card)}${c.hasCard ? ` (${money(c.importedCard)} from statements)` : ''}${c.income > 0 ? ` · ${pct(c.totalExpenses / c.income)} of income` : ''}` })}
@@ -1408,7 +1501,7 @@
           : dashCard(esc(Fmt.currencySymbol()), 'var(--s6)', 'Income sources', Charts.barList(sources.map((x) => ({ name: x.label, amount: x.amount, color: 'var(--s6)' })),
             { basis: c.income, basisLabel: 'income', empty: 'No income entered.', limit: 6 }))}
         ${dashCard('◎', 'var(--s7)', 'Leftover plan', Charts.barList([...foldAllocs(c.allocs), { name: 'Unallocated', amount: Math.max(c.unallocated, 0), color: 'var(--neutral)' }],
-          { basis: c.pool, basisLabel: 'leftover', empty: c.left > 0 ? 'No plan for the leftover yet.' : 'Nothing left to plan this month.', limit: 6 }))}
+          { basis: c.pool, basisLabel: 'leftover', empty: c.left > 0 ? 'No plan for the leftover yet.' : `Nothing left to plan ${p.kind === 'month' ? 'this month' : p.inLabel}.`, limit: 6 }))}
         ${dashCard('▥', LEFT_COLOR, `Expenses vs money left, by ${trendUnit(p)}`, expensesVsLeft(td, p), 'wide trend')}
         ${dashCard('↓', EXPENSE_COLOR, 'Biggest expenses', biggestExpenses(td, c))}
       </div>`;
@@ -1426,12 +1519,22 @@
       };
     });
     const review = view.querySelector('[data-review]');
-    if (review) review.onclick = () => { ctx.ui.panel = 'transactions'; ctx.ui.txFilter = { q: '', cat: 'none' }; };
+    if (review) {
+      review.onclick = () => {
+        // In week/year views, open the (charge) month of the first purchase that needs a category.
+        const first = c.txns.find((t) => !t.cat);
+        if (p.kind !== 'month' && first) ctx.ui.month = first.month;
+        ctx.ui.panel = 'transactions';
+        ctx.ui.txFilter = { q: '', cat: 'none' };
+      };
+    }
     // The trend chart is drawn to its card's size so it fills the space with readable labels.
     const trendBody = view.querySelector('.trend .chart-body');
     const redrawTrend = (wide) => {
       if (!trendBody || trendBody.closest('.show-table')) return;
-      const legendH = 26, tableBtn = trendBody.querySelector('.table-toggle');
+      const legend = trendBody.querySelector('.legend');
+      const legendH = (legend ? legend.offsetHeight : 20) + 10; // + the chart's top margin
+      const tableBtn = trendBody.querySelector('.table-toggle');
       const size = wide ? { width: trendBody.clientWidth, height: trendBody.clientHeight - legendH } : { width: Math.max(320, trendBody.clientWidth) };
       const open = tableBtn && tableBtn.open;
       trendBody.innerHTML = expensesVsLeft(td, p, size);
