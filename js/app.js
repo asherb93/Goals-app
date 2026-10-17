@@ -68,7 +68,10 @@
     hideTooltip();
     remotePending = false;
     document.title = `${topic.title} · Goals`;
-    if (!ui[topic.id]) ui[topic.id] = { month: Fmt.monthKey(new Date()) };
+    // View state is kept per topic and per person, so e.g. a half-done statement import on someone
+    // else's data never shows up on mine. The selected month carries over.
+    const uiKey = person ? `${topic.id}:${person}` : topic.id;
+    if (!ui[uiKey]) ui[uiKey] = { month: (ui[topic.id] && ui[topic.id].month) || Fmt.monthKey(new Date()) };
 
     const editors = sharedWithMe.filter((p) => levelFor(p.id, topic.id) === 'edit');
     if (view === 'dashboard' || editors.length) main.append(peopleBar(topic, view, person));
@@ -79,7 +82,7 @@
     if (!person) {
       Fmt.setCurrency(Store.settings.currency);
       const ctx = {
-        data: Store.topic(topic.id), isMe: true, readOnly: false, owner: Store.me, ui: ui[topic.id], storage: Store.backend.mode,
+        data: Store.topic(topic.id), isMe: true, readOnly: false, owner: Store.me, ui: ui[uiKey], storage: Store.backend.mode,
         inputHref: href(topic, 'input'), changed: () => Store.changed(), rerender: render,
       };
       view === 'input' ? topic.renderInput(body, ctx) : topic.renderDashboard(body, ctx);
@@ -87,7 +90,7 @@
     }
 
     const owner = sharedWithMe.find((p) => p.id === person);
-    const level = levelFor(person, topic.id);
+    let level = levelFor(person, topic.id);
     if (!owner || level === 'none') {
       body.innerHTML = `<section class="card empty-state"><p>${owner ? `${esc(owner.name)} doesn't share ${esc(topic.title)} with you.` : "This isn't shared with you."}</p></section>`;
       return;
@@ -111,10 +114,16 @@
       if (seq !== renderSeq) return;
       body.innerHTML = '';
     }
+    // The server just told us what this person allows; it wins over the sharing list we had.
+    if (doc.access && !Sync.equal(doc.access, sharedAccess[person])) {
+      sharedAccess[person] = doc.access;
+      return render();
+    }
+    level = doc.level(topic.id);
     Fmt.setCurrency(doc.blob.settings.currency);
     const ctx = {
       data: level === 'edit' ? doc.topic(topic.id) : doc.blob.topics[topic.id] || {},
-      isMe: false, readOnly: level !== 'edit', owner, ui: ui[topic.id], storage: Store.backend.mode,
+      isMe: false, readOnly: level !== 'edit', owner, ui: ui[uiKey], storage: Store.backend.mode,
       inputHref: href(topic, 'input', level === 'edit' ? person : null),
       changed: level === 'edit' ? () => doc.changed() : () => {}, rerender: render,
     };
@@ -138,7 +147,7 @@
     el.innerHTML = `
       <div class="people-pills">${pill(Store.me, true)}${shown.map((p) => pill(p, false)).join('')}</div>
       <div class="people-actions">
-        ${person ? `${level === 'edit'
+        ${person && level !== 'none' ? `${level === 'edit'
           ? `<span class="can-edit">✎ ${view === 'input' ? `Editing ${esc((sharedWithMe.find((p) => p.id === person) || {}).name || '')}'s ${esc(topic.title)}` : 'You can edit this'}</span>`
           : '<span class="view-only">View only</span>'}<button class="btn btn-small" data-refresh>Refresh</button>` : ''}
         <button class="btn btn-small" data-share>${myViewers.length ? `Shared with ${myViewers.length}` : 'Share'}</button>
@@ -148,6 +157,7 @@
     if (refresh) {
       refresh.onclick = async () => {
         refresh.disabled = true;
+        await refreshPeople();
         const doc = Store.doc(person);
         try { if (doc) await doc.refresh(); } catch (e) { toast(e.message); }
         render();
@@ -165,7 +175,8 @@
       sharedAccess = sharing.sharedAccess;
       myViewers = Object.keys(myAccess);
       sharedWithMe = all.filter((p) => sharedAccess[p.id]);
-      sharedWithMe.forEach((p) => { const d = Store.doc(p.id); if (d) d.access = sharedAccess[p.id]; });
+      // Changed permissions: their data is loaded again (newly shared topics come in from the server).
+      Object.keys(Object.assign({}, JSON.parse(before)[1], sharedAccess)).forEach((id) => Store.accessChanged(id, sharedAccess[id]));
       Store.setCollab(Object.values(myAccess).some((a) => Object.values(a).includes('edit')));
       return before !== JSON.stringify([myAccess, sharedAccess]);
     } catch (e) {
@@ -334,6 +345,7 @@
       pending: 'Saving soon…',
       saving: 'Saving…',
       error: 'Not saved yet, retrying',
+      blocked: 'Not saved',
     }[status] || '';
     el.textContent = text;
     el.className = 'sync ' + status;
@@ -367,38 +379,59 @@
     const dlg = $('sharing');
     const body = $('sharing-body');
     body.innerHTML = '<div class="loading">Loading…</div>';
+    $('sharing-save').hidden = true;
     dlg.showModal();
     await refreshPeople();
+    if (!dlg.open) return;
     const others = people.filter((p) => p.id !== Store.me.id);
     const sheets = Store.backend.mode === 'sheets';
-    const select = (p, t) => {
-      const level = levelOf(myAccess[p.id], t.id);
-      return `<select class="select access-select" data-viewer="${esc(p.id)}" data-topic="${esc(t.id)}" aria-label="${esc(p.name)}: ${esc(t.title)}">
-        ${Object.keys(LEVEL_LABELS).map((l) => `<option value="${l}"${l === level ? ' selected' : ''}>${LEVEL_LABELS[l]}</option>`).join('')}</select>`;
+    const options = (level) => Object.keys(LEVEL_LABELS).map((l) => `<option value="${l}"${l === level ? ' selected' : ''}>${LEVEL_LABELS[l]}</option>`).join('');
+    const select = (p, t) => `<label class="topic-access"><span>${esc(t.title)}</span>
+      <select class="select access-select" data-viewer="${esc(p.id)}" data-topic="${esc(t.id)}" aria-label="${esc(p.name)}: ${esc(t.title)}">${options(levelOf(myAccess[p.id], t.id))}</select></label>`;
+    // One choice for all of my data, unless the person was given different access per topic.
+    const overall = (p) => {
+      const levels = new Set(topics.map((t) => levelOf(myAccess[p.id], t.id)));
+      return levels.size === 1 ? [...levels][0] : 'custom';
     };
-    const theirs = (p) => topics.map((t) => ({ t, level: levelFor(p.id, t.id) })).filter((x) => x.level !== 'none');
+    const theirs = (p) => {
+      const levels = topics.map((t) => ({ t, level: levelFor(p.id, t.id) }));
+      if (new Set(levels.map((x) => x.level)).size === 1) return levels[0].level === 'edit' ? '<strong>can edit everything</strong>' : 'can view everything';
+      return levels.filter((x) => x.level !== 'none').map((x) => `${esc(x.t.title)}: ${x.level === 'edit' ? '<strong>can edit</strong>' : 'can view'}`).join(' · ');
+    };
     body.innerHTML = `
       ${others.length ? `
         <h3 class="dialog-sub">What others can see and change</h3>
-        <p class="hint">“Can edit” lets them change that topic, e.g. plan meals or tick groceries with you. Changes you both make are merged when they're saved.</p>
-        <div class="table-scroll"><table class="access-table">
-          <thead><tr><th scope="col">Person</th>${topics.map((t) => `<th scope="col">${esc(t.title)}</th>`).join('')}</tr></thead>
-          <tbody>${others.map((p) => `<tr><th scope="row"><span class="share-person">${avatar(p)}<span>${esc(p.name)}</span></span></th>
-            ${topics.map((t) => `<td>${select(p, t)}</td>`).join('')}</tr>`).join('')}</tbody>
-        </table></div>` : `
+        <p class="hint">“Can edit” lets them work in your data with you: plan meals, add recipes, tick groceries, enter numbers. Changes you both make are merged when they're saved.</p>
+        <div class="access-list">${others.map((p) => {
+          const o = overall(p);
+          return `<div class="access-person" data-person="${esc(p.id)}">
+            <div class="access-main"><span class="share-person">${avatar(p)}<span>${esc(p.name)}</span></span>
+              <select class="select access-all" data-viewer="${esc(p.id)}" aria-label="${esc(p.name)}: all my data">
+                ${options(o === 'custom' ? '' : o).replace(/Can view</, 'Can view everything<').replace(/Can edit</, 'Can edit everything<')}
+                <option value="custom"${o === 'custom' ? ' selected' : ''}>Choose per topic…</option></select></div>
+            <div class="access-topics"${o === 'custom' ? '' : ' hidden'}>${topics.map((t) => select(p, t)).join('')}</div>
+          </div>`;
+        }).join('')}</div>` : `
         <p class="empty">Nobody else has a profile yet. ${sheets
           ? 'Send them the web app URL below; they open Goals, choose Google Sheets storage, paste it and add themselves.'
           : 'They can add themselves from the sign-in screen (Switch person → Add person).'}</p>`}
       <h3 class="dialog-sub">Shared with me</h3>
       ${sharedWithMe.length
         ? `<div class="share-list">${sharedWithMe.map((p) => `<div class="share-row">${avatar(p)}<span class="grow">${esc(p.name)}</span>
-            <span class="muted share-levels">${theirs(p).map((x) => `${esc(x.t.title)}: ${x.level === 'edit' ? '<strong>can edit</strong>' : 'can view'}`).join(' · ')}</span></div>`).join('')}</div>`
+            <span class="muted share-levels">${theirs(p)}</span></div>`).join('')}</div>`
         : '<p class="empty">Nobody has shared anything with you yet.</p>'}
       ${sheets ? `
         <h3 class="dialog-sub">Invite family</h3>
         <div class="inline-row"><input class="text-input grow" readonly value="${esc(Store.device.backend.url)}" id="invite-url">
           <button type="button" class="btn btn-small" id="copy-invite">Copy</button></div>` : ''}
       <div class="form-error" id="sharing-error"></div>`;
+    body.querySelectorAll('.access-all').forEach((sel) => {
+      sel.onchange = () => {
+        const box = sel.closest('.access-person').querySelector('.access-topics');
+        box.hidden = sel.value !== 'custom';
+        if (sel.value !== 'custom') box.querySelectorAll('.access-select').forEach((x) => { x.value = sel.value; });
+      };
+    });
     const copy = $('copy-invite');
     if (copy) copy.onclick = () => { navigator.clipboard.writeText($('invite-url').value); copy.textContent = 'Copied'; };
     $('sharing-save').hidden = !others.length;
@@ -407,10 +440,17 @@
   function initSharing() {
     $('sharing-save').addEventListener('click', async (e) => {
       e.preventDefault();
+      if (!$('sharing-body').querySelector('.access-list')) return;
+      // "Everything" is saved as '*', so topics added later are shared the same way.
       const access = {};
-      $('sharing-body').querySelectorAll('.access-select').forEach((sel) => {
-        if (sel.value === 'none') return;
-        (access[sel.dataset.viewer] = access[sel.dataset.viewer] || {})[sel.dataset.topic] = sel.value;
+      $('sharing-body').querySelectorAll('.access-person').forEach((row) => {
+        const id = row.dataset.person;
+        const all = row.querySelector('.access-all').value;
+        if (all === 'view' || all === 'edit') { access[id] = { '*': all }; return; }
+        if (all !== 'custom') return;
+        row.querySelectorAll('.access-select').forEach((sel) => {
+          if (sel.value !== 'none') (access[id] = access[id] || {})[sel.dataset.topic] = sel.value;
+        });
       });
       const btn = $('sharing-save');
       btn.disabled = true;
@@ -435,7 +475,7 @@
     const dlg = $('storage');
     const form = $('storage-form');
     form.mode.value = Store.device.backend.mode;
-    $('sheets-url').value = Store.device.backend.url;
+    $('sheets-url').value = Store.device.backend.url || Store.DEFAULT_SHEETS_URL;
     $('sheets-test-result').textContent = '';
     syncStorageForm();
     if ($('settings').open) $('settings').close();

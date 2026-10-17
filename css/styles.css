@@ -1188,4 +1188,11 @@ button.agenda-meal:hover { border-color: var(--tint); }
   font-size: 12px; font-weight: 650; color: var(--ink); padding: 4px 10px; border-radius: 999px;
   background: color-mix(in srgb, var(--s3) 18%, var(--surface)); border: 1px solid color-mix(in srgb, var(--s3) 45%, transparent);
 }
+.access-list { display: flex; flex-direction: column; gap: 6px; }
+.access-person { border: 1px solid var(--border); border-radius: 12px; padding: 8px 10px; }
+.access-main { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.access-all { min-width: 190px; padding: 6px 8px; font-size: 13px; }
+.access-topics { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--grid); }
+.access-topics[hidden] { display: none; }
+.topic-access { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
 

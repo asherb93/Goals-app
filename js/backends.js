@@ -26,7 +26,7 @@
   const LEVELS = ['view', 'edit'];
   function cleanAccess(a) {
     const out = {};
-    Object.keys(a && typeof a === 'object' ? a : {}).forEach((k) => {
+    Object.keys(a && typeof a === 'object' ? a : {}).slice(0, 20).forEach((k) => {
       if (/^([\w-]{1,40}|\*)$/.test(k) && LEVELS.includes(a[k])) out[k] = a[k];
     });
     return out;
@@ -127,7 +127,7 @@
     async saveData(token, data, rows, baseRev) {
       const d = db();
       const cur = d.data[token];
-      if (baseRev != null && cur && cur.updatedAt !== baseRev) return { conflict: true, data: cur.data, updatedAt: cur.updatedAt };
+      if (baseRev != null && (cur ? cur.updatedAt : 0) !== baseRev) return { conflict: true, data: cur ? cur.data : null, updatedAt: cur ? cur.updatedAt : 0 };
       const updatedAt = nextRev(cur && cur.updatedAt);
       d.data[token] = { data, updatedAt };
       put(d);
@@ -170,7 +170,7 @@
       const share = d.shares.find((x) => x.ownerId === ownerId && x.viewerId === token);
       if (!share) throw fail('This is not shared with you.', 'FORBIDDEN');
       const cur = d.data[ownerId];
-      return { data: visible(cur && cur.data, accessOf(share)), updatedAt: cur ? cur.updatedAt : null, access: accessOf(share) };
+      return { data: visible(cur && cur.data, accessOf(share)), updatedAt: cur ? cur.updatedAt : 0, access: accessOf(share) };
     },
 
     async saveUserData(token, ownerId, topics, baseRev) {
@@ -180,8 +180,8 @@
       const ids = Object.keys(topics || {});
       if (ids.some((t) => levelOf(accessOf(share), t) !== 'edit')) throw fail('You can only view this, not edit it.', 'FORBIDDEN');
       const cur = d.data[ownerId];
-      if (baseRev != null && cur && cur.updatedAt !== baseRev) {
-        return { conflict: true, data: visible(cur.data, accessOf(share)), updatedAt: cur.updatedAt };
+      if (baseRev != null && (cur ? cur.updatedAt : 0) !== baseRev) {
+        return { conflict: true, data: visible(cur && cur.data, accessOf(share)), updatedAt: cur ? cur.updatedAt : 0 };
       }
       const next = cur && cur.data ? JSON.parse(JSON.stringify(cur.data)) : { version: 2, settings: { currency: 'ILS' }, topics: {} };
       if (!next.topics) next.topics = {};

@@ -26,7 +26,7 @@ Each person then clicks **Add person** and picks a passcode. After that, use **S
 
 ## Editing together
 
-In **Sharing…**, every person gets a choice per topic: **No access**, **Can view** or **Can edit**. With **Can edit**, they see a ✎ pill with your name on that topic's input screen (e.g. Food → Plan). They plan meals, tick groceries or enter numbers right in your data, and it's saved to your rows in the sheet.
+In **Sharing…**, every person gets one choice for all your data: **No access**, **Can view everything** or **Can edit everything** (topics added later are included). Pick **Choose per topic…** to set Food and Monthly Balance separately. With **Can edit**, they see a ✎ pill with your name on that topic's input screen (e.g. Food → Plan). They plan meals, tick groceries or enter numbers right in your data, and it's saved to your rows in the sheet.
 
 - If you both change things at about the same time, the app merges both sets of changes when saving. Only when you both changed the very same value does the later save win.
 - While someone can edit your data (or while you look at someone else's), the app checks for their changes every 20 seconds and when you come back to the tab. It doesn't redraw while you're typing in a field.

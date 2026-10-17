@@ -107,9 +107,13 @@ const ACTIONS = {
   saveData: (req) => {
     const user = auth(req.token);
     const rev = revOf(user.id);
-    if (req.baseRev != null && rev && rev !== Number(req.baseRev)) {
+    // A copy of the app from before shared editing saves without a version and would undo editors' changes.
+    if (req.baseRev == null && rev && shares().some((s) => s.ownerId === user.id && Object.keys(s.access).some((t) => s.access[t] === 'edit'))) {
+      throw err('This copy of Goals is out of date. Reload or update it to keep saving.', 'OLD_APP');
+    }
+    if (req.baseRev != null && rev !== Number(req.baseRev)) {
       const cur = readData(user.id);
-      return { conflict: true, data: cur.data, updatedAt: cur.updatedAt };
+      return { conflict: true, data: cur ? cur.data : null, updatedAt: cur ? cur.updatedAt : 0 };
     }
     const updatedAt = writeData(user.id, req.data || {}, rev);
     writeReadable(user, req.rows || {});
@@ -163,7 +167,7 @@ const ACTIONS = {
     const user = auth(req.token);
     const share = shareFor(req.ownerId, user.id);
     const cur = readData(req.ownerId);
-    return { data: visible(cur && cur.data, share.access), updatedAt: cur ? cur.updatedAt : null, access: share.access };
+    return { data: visible(cur && cur.data, share.access), updatedAt: cur ? cur.updatedAt : 0, access: share.access };
   },
 
   // topics: {topicId: data} for topics shared with this person as "can edit".
@@ -177,8 +181,8 @@ const ACTIONS = {
     const owner = users().find((u) => u.id === req.ownerId);
     if (!owner) throw err('That person no longer exists.', 'FORBIDDEN');
     const cur = readData(owner.id);
-    if (req.baseRev != null && cur && cur.updatedAt !== Number(req.baseRev)) {
-      return { conflict: true, data: visible(cur.data, share.access), updatedAt: cur.updatedAt };
+    if (req.baseRev != null && (cur ? cur.updatedAt : 0) !== Number(req.baseRev)) {
+      return { conflict: true, data: visible(cur && cur.data, share.access), updatedAt: cur ? cur.updatedAt : 0 };
     }
     const next = cur && cur.data && typeof cur.data === 'object' ? cur.data : { version: 2, settings: { currency: 'ILS' }, topics: {} };
     if (!next.topics || typeof next.topics !== 'object') next.topics = {};
@@ -233,6 +237,8 @@ function rows(name, headers) {
 }
 
 function rewrite(sh, headers, values, asText) {
+  // Check before clearing, so a value Sheets would refuse can't leave the tab empty.
+  if (values.some((r) => r.some((v) => String(v == null ? '' : v).length > 50000))) throw new Error('Too much to save in one cell.');
   if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getMaxColumns()).clearContent();
   if (!values.length) return;
   const range = sh.getRange(2, 1, values.length, values[0].length);
@@ -288,7 +294,7 @@ function writeData(userId, data, prevRev) {
 
 function cleanAccess(a) {
   const result = {};
-  Object.keys(a && typeof a === 'object' ? a : {}).forEach((k) => {
+  Object.keys(a && typeof a === 'object' ? a : {}).slice(0, 20).forEach((k) => {
     if (/^([\w-]{1,40}|\*)$/.test(k) && LEVELS.indexOf(a[k]) >= 0) result[k] = a[k];
   });
   return result;

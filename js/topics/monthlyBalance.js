@@ -63,8 +63,10 @@
       const cardCats = new Set(usedCards
         ? td.transactions.filter((t) => t.month === key).map((t) => txnCategory(td, t).id).filter((id) => id && !isExcluded(td, id))
         : []);
-      const lines = (m.expenses || []).map((e) => ({
-        id: e.id || Fmt.uid(), name: e.name || '', category: e.category || '', amount: e.amount,
+      // Ids made here are fixed (not random), so two people or devices migrating the same data get the
+      // same rows and merging their saves doesn't double them.
+      const lines = (m.expenses || []).map((e, i) => ({
+        id: e.id || `v2-${key}-${i}`, name: e.name || '', category: e.category || '', amount: e.amount,
         paid: e.paidBy || (usedCards && e.category && cardCats.has(e.category) ? 'card' : 'direct'),
         guessed: !e.paidBy,
       }));
@@ -72,7 +74,7 @@
       // is lost. Lines in "not spending" categories make no sense as targets.
       const wasPlan = usedCards || lines.some((l) => l.paid === 'card');
       m.targets = wasPlan
-        ? lines.filter((l) => !isExcluded(td, l.category)).map((l) => ({ id: Fmt.uid(), name: l.name, category: l.category, amount: l.amount }))
+        ? lines.filter((l) => !isExcluded(td, l.category)).map((l) => ({ id: `t-${key}-${l.id}`, name: l.name, category: l.category, amount: l.amount }))
         : [];
       // `guessed`: v2 would have turned this line into a card budget once a statement had purchases in
       // its category. The import step offers to do the same (move it to targets).
@@ -85,9 +87,9 @@
 
   // Model version 4 replaces the single `salary` number with a list of income sources.
   function salaryToIncomes(td) {
-    Object.values(td.months).forEach((m) => {
+    Object.entries(td.months).forEach(([key, m]) => {
       if (Array.isArray(m.incomes)) return;
-      m.incomes = num(m.salary) > 0 ? [{ id: Fmt.uid(), name: 'Net salary', amount: m.salary, repeat: true }] : [];
+      m.incomes = num(m.salary) > 0 ? [{ id: `salary-${key}`, name: 'Net salary', amount: m.salary, repeat: true }] : [];
       delete m.salary;
     });
   }
@@ -590,6 +592,17 @@
     const tab = ctx.ui.inputTab;
 
     function persist() {
+      // Someone else started this month while it was blank here: add what was typed to their month.
+      const live = td.months[key];
+      if (live && live !== m) {
+        ['incomes', 'targets', 'expenses', 'allocations'].forEach((k) => {
+          if (!Array.isArray(live[k])) live[k] = [];
+          (m[k] || []).forEach((x) => { if (!live[k].some((y) => y.id === x.id)) live[k].push(x); });
+        });
+        ctx.changed();
+        ctx.rerender();
+        return;
+      }
       if (hasContent(m)) td.months[key] = m;
       else delete td.months[key];
       ctx.changed();
@@ -974,6 +987,8 @@
         const row = t.closest('.row');
         if (!row || !t.dataset.field) return;
         const { item } = findItem(row);
+        // The row was removed by someone else's change that arrived meanwhile: show the current data.
+        if (!item) { ctx.rerender(); return; }
         const f = t.dataset.field;
         item[f] = f === 'name' || f === 'category' ? t.value : (t.value === '' ? '' : num(t.value));
         if (f === 'category') {

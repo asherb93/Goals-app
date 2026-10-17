@@ -17,10 +17,15 @@
     try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; }
   }
 
+  // The family's Google Sheet web app. New devices use it automatically; Settings → Where data is
+  // stored can still switch a device to "this device only" or another sheet.
+  const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbwiyPNwCzHwFe2qtpeCirl4R_FluVDaDjF_xEzQgyAQt8Hs9x4b6g6u-K42p8rsQH68/exec';
   const device = Object.assign(
-    { theme: 'auto', backend: { mode: 'local', url: '' }, session: null },
+    { theme: 'auto', backend: { mode: 'sheets', url: DEFAULT_SHEETS_URL }, session: null },
     readJSON(DEVICE_KEY)
   );
+  // A sheets choice without a URL uses the family sheet.
+  if (device.backend.mode === 'sheets' && !device.backend.url) device.backend.url = DEFAULT_SHEETS_URL;
   // Carry the theme over from the first version of the app.
   const legacy = readJSON('goals:v1');
   if (legacy && legacy.settings && legacy.settings.theme && !readJSON(DEVICE_KEY)) device.theme = legacy.settings.theme;
@@ -54,11 +59,10 @@
       : Backends.local;
   }
 
-  const token = () => device.session.token;
   const rowsOf = (blob) => (Store.rowsProvider ? Store.rowsProvider(blob) : {});
   const topicRows = (id, data) => (Store.topicRowsProvider ? Store.topicRowsProvider(id, data) : {});
 
-  const ORDER = ['saved', 'pending', 'saving', 'error'];
+  const ORDER = ['saved', 'pending', 'saving', 'error', 'blocked'];
   function overallStatus() {
     let worst = 'saved', detail = '';
     [mine].concat(Object.values(docs)).filter(Boolean).forEach((d) => {
@@ -71,9 +75,14 @@
     statusListeners.forEach((fn) => fn(s.status, s.detail));
   }
 
+  // A document belongs to the session it was opened in: a save still running after "Switch person"
+  // keeps using that session's token and cache, and stops once the session is closed.
   function Doc(ownerId, isMine) {
     this.ownerId = ownerId;
     this.mine = isMine;
+    this.token = device.session.token;
+    this.userId = me.id;
+    this.closed = false;
     this.blob = normalize(null);
     this.base = null;
     this.rev = null;
@@ -88,7 +97,7 @@
   }
 
   Doc.prototype = {
-    cacheKey() { return `goals:cache:${backend.mode}:${me.id}${this.mine ? '' : ':' + this.ownerId}`; },
+    cacheKey() { return `goals:cache:${backend.mode}:${this.userId}${this.mine ? '' : ':' + this.ownerId}`; },
 
     // My data is always cached (it's also the offline copy); someone else's only while it has unsaved changes.
     writeCache() {
@@ -101,6 +110,24 @@
     setStatus(s, detail) { this.status = s; this.detail = detail || ''; emitStatus(); },
 
     level(topic) { return this.mine ? 'edit' : levelOf(this.access, topic); },
+
+    // New permissions from the owner: a save that was refused may go through now.
+    setAccess(access) {
+      if (!access || Sync.equal(access, this.access)) return;
+      this.access = access;
+      if (this.blocked) { this.blocked = ''; if (this.dirty) this.save(); else this.setStatus('saved'); }
+    },
+
+    // Someone else's topics I may not change go back to the server's copy (e.g. access was lowered).
+    keepOnlyEditable(blob, base) {
+      if (this.mine) return blob;
+      Object.keys(blob.topics).forEach((t) => {
+        if (this.level(t) === 'edit') return;
+        if (base && t in base.topics) blob.topics[t] = Sync.clone(base.topics[t]);
+        else delete blob.topics[t];
+      });
+      return blob;
+    },
 
     topic(id) {
       if (!this.blob.topics[id]) this.blob.topics[id] = {};
@@ -118,6 +145,13 @@
     // Fold a newer server version into what's on screen, keeping unsaved changes.
     merge(theirs, rev) {
       const merged = normalize(Sync.merge3(this.base || theirs, this.blob, theirs));
+      // A topic of someone else's that just became visible: what's on screen is only local setup
+      // (defaults), so the server's copy is the truth.
+      if (!this.mine) {
+        Object.keys(theirs.topics).forEach((t) => {
+          if (!this.base || !(t in this.base.topics)) merged.topics[t] = Sync.clone(theirs.topics[t]);
+        });
+      }
       const changed = !Sync.equal(merged, this.blob);
       Sync.patchInPlace(this.blob, merged);
       this.base = Sync.clone(theirs);
@@ -130,12 +164,13 @@
       const cached = readJSON(this.cacheKey());
       let remote;
       try {
-        remote = this.mine ? await backend.loadData(token()) : await backend.loadUserData(token(), this.ownerId);
+        remote = this.mine ? await backend.loadData(this.token) : await backend.loadUserData(this.token, this.ownerId);
       } catch (e) {
+        if (!this.mine && e.code === 'FORBIDDEN') localStorage.removeItem(this.cacheKey());
         if (this.mine && e.code === 'OFFLINE' && cached) {
           this.blob = normalize(cached.data);
           this.base = cached.base ? normalize(cached.base) : null;
-          this.rev = cached.rev == null ? null : cached.rev;
+          this.rev = cached.rev == null ? 0 : cached.rev;
           this.dirty = !!cached.pending;
           this.ready = true;
           this.setStatus('error', e.message);
@@ -145,13 +180,17 @@
       }
       if (!this.mine && remote && remote.access) this.access = remote.access;
       const theirs = normalize(remote && remote.data);
-      const rev = remote && remote.updatedAt != null ? remote.updatedAt : null;
+      // 0 = nothing saved yet; saves then still carry a version, so two first saves can't overwrite each other.
+      const rev = remote && remote.updatedAt != null ? remote.updatedAt : 0;
       this.ready = true;
       // Unsaved changes from this device: merge them into what the server has now.
-      // (A cache from before versioned saves has no base; its changes then win, as they used to.)
       if (cached && cached.pending) {
+        const local = normalize(cached.data);
+        // A cache from before versioned saves has no base. Its changes win, as they used to, but it
+        // comes from a copy that only had Monthly Balance, so it can't speak for other topics.
+        if (!cached.base) Object.keys(theirs.topics).forEach((t) => { if (t !== 'monthly-balance') local.topics[t] = theirs.topics[t]; });
         const base = cached.base ? normalize(cached.base) : theirs;
-        this.blob = normalize(Sync.merge3(base, normalize(cached.data), theirs));
+        this.blob = this.keepOnlyEditable(normalize(Sync.merge3(base, local, theirs)), theirs);
         this.base = Sync.clone(theirs);
         this.rev = rev;
         this.dirty = true;
@@ -182,6 +221,7 @@
       this.dirty = true;
       this.writeCache();
       clearTimeout(this.timer);
+      if (this.blocked) { this.setStatus('blocked', this.blocked); return; }
       if (backend.mode === 'local') this.save();
       else { this.setStatus('pending'); this.timer = setTimeout(() => this.save(), SAVE_DELAY); }
     },
@@ -189,31 +229,46 @@
     save() { clearTimeout(this.timer); return this.enqueue(() => this.saveNow(0)); },
 
     async saveNow(attempt) {
-      if (!this.dirty || !me || this.blocked) return;
+      if (!this.dirty || this.closed || this.blocked) return;
       this.dirty = false;
       this.setStatus('saving');
       const sent = Sync.clone(this.blob);
-      const topics = this.mine ? null : this.editable(sent);
+      const base0 = this.base || normalize(null);
+      // Someone else's data: send only the topics I may edit and actually changed.
+      const topics = this.mine ? null : this.editable(sent).filter((t) => !Sync.equal(sent.topics[t], base0.topics[t]));
+      if (!this.mine && !topics.length) {
+        const lost = Object.keys(sent.topics).some((t) => this.level(t) !== 'edit' && !Sync.equal(sent.topics[t], base0.topics[t]));
+        this.keepOnlyEditable(this.blob, this.base);
+        this.writeCache();
+        if (lost) {
+          this.setStatus('blocked', 'You can only view this now, so that change was not saved.');
+          remoteListeners.forEach((fn) => fn(this));
+        } else {
+          this.setStatus('saved');
+        }
+        return;
+      }
       let res;
       try {
         if (this.mine) {
-          res = await backend.saveData(token(), sent, rowsOf(sent), this.rev);
+          res = await backend.saveData(this.token, sent, rowsOf(sent), this.rev);
         } else {
-          if (!topics.length) { this.setStatus('saved'); return; }
           const data = {}, rows = {};
           topics.forEach((t) => { data[t] = sent.topics[t]; Object.assign(rows, topicRows(t, sent.topics[t])); });
-          res = await backend.saveUserData(token(), this.ownerId, data, this.rev, rows);
+          res = await backend.saveUserData(this.token, this.ownerId, data, this.rev, rows);
         }
       } catch (e) {
+        if (this.closed) return;
         this.dirty = true;
         this.writeCache();
         this.setStatus('error', e.message);
         if (e.code === 'AUTH') { if (Store.onAuthLost) Store.onAuthLost(); return; }
         // Access was taken away, or the sheet's script is too old to accept it: don't keep retrying.
-        if (e.code === 'FORBIDDEN' || e.code === 'OLD_SCRIPT') { this.blocked = e.message; return; }
+        if (e.code === 'FORBIDDEN' || e.code === 'OLD_SCRIPT') { this.blocked = e.message; this.setStatus('blocked', e.message); return; }
         this.timer = setTimeout(() => this.save(), RETRY_DELAY);
         return;
       }
+      if (this.closed) return;
       if (res && res.conflict) {
         // Someone saved first: merge their version with ours (including edits made meanwhile), then save again.
         this.merge(normalize(res.data), res.updatedAt);
@@ -238,11 +293,14 @@
     // Get the newest saved version (if it changed) and merge it in.
     refresh() {
       return this.enqueue(async () => {
-        if (this.dirty) return; // the pending save merges anyway
-        const r = this.mine ? await backend.loadData(token()) : await backend.loadUserData(token(), this.ownerId);
-        if (!this.mine && r && r.access) this.access = r.access;
-        const rev = r && r.updatedAt != null ? r.updatedAt : null;
-        if (rev === this.rev) return;
+        if (this.dirty || this.closed) return; // the pending save merges anyway
+        const r = this.mine ? await backend.loadData(this.token) : await backend.loadUserData(this.token, this.ownerId);
+        if (this.closed) return;
+        const accessChanged = !this.mine && r && r.access && !Sync.equal(r.access, this.access);
+        if (accessChanged) this.setAccess(r.access);
+        const rev = r && r.updatedAt != null ? r.updatedAt : 0;
+        const newTopics = !this.mine && r && r.data && Object.keys(r.data.topics || {}).some((t) => !this.base || !(t in this.base.topics));
+        if (rev === this.rev && !accessChanged && !newTopics) return;
         this.merge(normalize(r && r.data), rev);
         this.writeCache();
       });
@@ -251,20 +309,26 @@
     // Last-chance save when the page closes. If someone saved in between it is refused, but the
     // changes stay in the local cache and get merged the next time the app opens.
     beacon() {
-      if (!this.dirty || !backend.beacon) return;
+      // Rows are left out to stay under the beacon size limit; the next normal save writes them.
+      if (!this.dirty || !backend.beacon || this.closed) return;
       if (this.mine) {
-        backend.beacon('saveData', { token: token(), data: this.blob, rows: rowsOf(this.blob), baseRev: this.rev });
+        backend.beacon('saveData', { token: this.token, data: this.blob, baseRev: this.rev });
         return;
       }
-      const data = {}, rows = {};
-      this.editable(this.blob).forEach((t) => { data[t] = this.blob.topics[t]; Object.assign(rows, topicRows(t, this.blob.topics[t])); });
-      if (Object.keys(data).length) backend.beacon('saveUserData', { token: token(), ownerId: this.ownerId, topics: data, baseRev: this.rev, rows });
+      const data = {};
+      this.editable(this.blob).forEach((t) => { data[t] = this.blob.topics[t]; });
+      if (Object.keys(data).length) backend.beacon('saveUserData', { token: this.token, ownerId: this.ownerId, topics: data, baseRev: this.rev });
     },
   };
 
   addEventListener('pagehide', () => {
     if (!me) return;
     [mine].concat(Object.values(docs)).filter(Boolean).forEach((d) => d.beacon());
+  });
+  // Leaving the tab (or the phone locking) saves normally, so the beacon is only a last resort.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden || !me) return;
+    [mine].concat(Object.values(docs)).filter((d) => d && d.dirty).forEach((d) => d.save());
   });
 
   // Notice other people's saves: my data while someone can edit it, and the other person's data on screen.
@@ -276,13 +340,13 @@
     if (!list.length || !backend.revs) return;
     let revs;
     try {
-      revs = await backend.revs(token(), list.filter((d) => !d.mine).map((d) => d.ownerId));
+      revs = await backend.revs(mine.token, list.filter((d) => !d.mine).map((d) => d.ownerId));
     } catch (e) {
       return; // offline, or an older sheet script: try again next time
     }
     list.forEach((d) => {
       const r = revs[d.ownerId];
-      if (r == null || r === d.rev || (!r && d.rev == null)) return;
+      if (r == null || r === d.rev || (!r && !d.rev)) return;
       d.refresh().catch(() => {});
     });
   }
@@ -305,6 +369,7 @@
   window.Store = {
     device,
     saveDevice,
+    DEFAULT_SHEETS_URL,
     rowsProvider: null,      // set by App: blob -> readable rows for the Google Sheet
     topicRowsProvider: null, // set by App: (topicId, topicData) -> that topic's readable rows
     onAuthLost: null,
@@ -339,13 +404,26 @@
         if (access) d.access = access;
         d.loading = d.load().catch((e) => { if (docs[ownerId] === d) delete docs[ownerId]; throw e; });
       } else if (access) {
-        d.access = access;
+        d.setAccess(access);
       }
       await d.loading;
       return d;
     },
 
     doc(ownerId) { return docs[ownerId] || null; },
+
+    // Sharing with this person changed: load their data again next time (unless edits are waiting).
+    accessChanged(ownerId, access) {
+      const d = docs[ownerId];
+      if (!d) return;
+      if (!access) { if (!d.dirty) { d.closed = true; clearTimeout(d.timer); delete docs[ownerId]; localStorage.removeItem(d.cacheKey()); emitStatus(); } return; }
+      if (Sync.equal(access, d.access)) return;
+      if (d.dirty) { d.setAccess(access); return; }
+      d.closed = true;
+      clearTimeout(d.timer);
+      delete docs[ownerId];
+      emitStatus();
+    },
 
     // The other person's document on screen (null for my own); it gets checked for their changes.
     watch(ownerId) {
@@ -383,14 +461,21 @@
     async createUser(details) { await startSession(await backend.createUser(details)); },
 
     signOut() {
-      const tok = device.session && device.session.token;
-      if (me && tok) {
-        [mine].concat(Object.values(docs)).filter((d) => d && d.dirty).forEach((d) => {
-          clearTimeout(d.timer);
-          if (d.mine) { backend.saveData(tok, d.blob, rowsOf(d.blob), d.rev).catch(() => {}); return; }
-          const data = {};
-          d.editable(d.blob).forEach((t) => { data[t] = d.blob.topics[t]; });
-          if (Object.keys(data).length) backend.saveUserData(tok, d.ownerId, data, d.rev, {}).catch(() => {});
+      if (me) {
+        const all = [mine].concat(Object.values(docs)).filter(Boolean);
+        all.forEach((d) => { d.closed = true; clearTimeout(d.timer); });
+        // Last save of unsaved changes; once it's accepted the cached copy no longer counts as pending.
+        all.filter((d) => d.dirty).forEach((d) => {
+          const key = d.cacheKey(), sent = Sync.clone(d.blob);
+          const done = (res) => {
+            if (!res || res.conflict) return; // stays pending in the cache and is merged on next sign-in
+            if (d.mine) localStorage.setItem(key, JSON.stringify({ data: sent, base: sent, rev: res.updatedAt, pending: false }));
+            else localStorage.removeItem(key);
+          };
+          if (d.mine) { backend.saveData(d.token, sent, rowsOf(sent), d.rev).then(done, () => {}); return; }
+          const data = {}, rows = {};
+          d.editable(sent).forEach((t) => { data[t] = sent.topics[t]; Object.assign(rows, topicRows(t, sent.topics[t])); });
+          if (Object.keys(data).length) backend.saveUserData(d.token, d.ownerId, data, d.rev, rows).then(done, () => {});
         });
       }
       me = null;
@@ -428,11 +513,13 @@
       const data = raw && raw.data && raw.data.topics ? raw.data : raw;
       if (!data || typeof data !== 'object' || !data.topics) throw new Error('This file is not a Goals backup.');
       Sync.patchInPlace(mine.blob, normalize(Sync.clone(data)));
+      mine.base = null; // a replacement, not an edit: it wins over the server copy instead of merging
       this.changed();
     },
 
     resetData() {
       Sync.patchInPlace(mine.blob, normalize({ settings: { currency: mine.blob.settings.currency } }));
+      mine.base = null;
       this.changed();
     },
   };

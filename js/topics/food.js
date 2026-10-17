@@ -38,9 +38,10 @@
       if (!d.people) d.people = [];
       if (!d.foods) d.foods = [];
       if (!d.recipes) {
-        d.recipes = STARTER_RECIPES.map((r) => ({
-          id: Fmt.uid(), name: r.name, video: '', steps: r.steps,
-          ingredients: r.ingredients.map(([food, grams]) => ({ id: Fmt.uid(), food, grams })),
+        // Fixed ids: if two people set up the same Food data at once, merging doesn't double the starters.
+        d.recipes = STARTER_RECIPES.map((r, i) => ({
+          id: `starter-${i}`, name: r.name, video: '', steps: r.steps,
+          ingredients: r.ingredients.map(([food, grams], j) => ({ id: `starter-${i}-${j}`, food, grams })),
         }));
       }
       if (!d.weeks) d.weeks = {};
@@ -294,6 +295,17 @@
     const tab = ctx.ui.foodTab;
 
     const persistWeek = () => {
+      // Someone else started this week while it was blank here: add what was done here to their week.
+      const live = td.weeks[wid];
+      if (live && live !== w) {
+        Object.assign(live.meals || (live.meals = {}), w.meals);
+        Object.assign(live.checked || (live.checked = {}), w.checked);
+        live.extra = live.extra || [];
+        w.extra.forEach((x) => { if (!live.extra.some((y) => y.id === x.id)) live.extra.push(x); });
+        ctx.changed();
+        ctx.rerender();
+        return;
+      }
       if (weekHasContent(w) || Object.keys(w.checked).length) td.weeks[wid] = w;
       else delete td.weeks[wid];
       ctx.changed();
@@ -333,6 +345,11 @@
       e.preventDefault();
       selectTab(ids[(next + ids.length) % ids.length], true);
     });
+
+    // A change from someone else can remove a row while it's on screen here; redraw instead of failing.
+    const guard = (fn) => (e) => {
+      try { fn(e); } catch (err) { if (err instanceof TypeError) ctx.rerender(); else throw err; }
+    };
 
     function draw(id) { ({ menu: drawMenu, groceries: drawGroceries, recipes: drawRecipes, people: drawPeople, foods: drawFoods })[id](); }
 
@@ -788,7 +805,7 @@
     }
 
     // --- events ---
-    view.addEventListener('change', (e) => {
+    view.addEventListener('change', guard((e) => {
       const t = e.target;
       if (t.dataset.cell) {
         const v = t.value;
@@ -830,9 +847,9 @@
         td.people.find((p) => p.id === t.closest('[data-person]').dataset.person).scale = t.value;
         ctx.changed();
       }
-    });
+    }));
 
-    view.addEventListener('input', (e) => {
+    view.addEventListener('input', guard((e) => {
       const t = e.target;
       if (t.dataset.r) {
         const r = td.recipes.find((x) => x.id === t.closest('[data-recipe]').dataset.recipe);
@@ -870,7 +887,7 @@
         return;
       }
       if (t.hasAttribute('data-off-q')) ctx.ui.offQuery = t.value;
-    });
+    }));
 
     view.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && e.target.hasAttribute('data-off-q')) { e.preventDefault(); offSearch(); }
@@ -884,7 +901,7 @@
       }
     });
 
-    view.addEventListener('click', (e) => {
+    view.addEventListener('click', guard((e) => {
       const btn = e.target.closest('[data-action], [data-off-add], [data-del-food]');
       if (!btn) return;
       const a = btn.dataset.action;
@@ -1021,7 +1038,7 @@
       } else if (a === 'off-search') {
         offSearch();
       }
-    });
+    }));
 
     draw(tab);
   }
